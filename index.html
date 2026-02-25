@@ -1,0 +1,233 @@
+<!DOCTYPE html><html class="default" lang="en" data-base="./"><head><meta charset="utf-8"/><meta http-equiv="x-ua-compatible" content="IE=edge"/><title>llamacpp-ui-metrics-extension</title><meta name="description" content="Documentation for llamacpp-ui-metrics-extension"/><meta name="viewport" content="width=device-width, initial-scale=1"/><link rel="stylesheet" href="assets/style.css"/><link rel="stylesheet" href="assets/highlight.css"/><script defer src="assets/main.js"></script><script async src="assets/icons.js" id="tsd-icons-script"></script><script async src="assets/search.js" id="tsd-search-script"></script><script async src="assets/navigation.js" id="tsd-nav-script"></script></head><body><script>document.documentElement.dataset.theme = localStorage.getItem("tsd-theme") || "os";document.body.style.display="none";setTimeout(() => window.app?app.showPage():document.body.style.removeProperty("display"),500)</script><header class="tsd-page-toolbar"><div class="tsd-toolbar-contents container"><a href="index.html" class="title">llamacpp-ui-metrics-extension</a><div id="tsd-toolbar-links"></div><button id="tsd-search-trigger" class="tsd-widget" aria-label="Search"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><use href="assets/icons.svg#icon-search"></use></svg></button><dialog id="tsd-search" aria-label="Search"><input role="combobox" id="tsd-search-input" aria-controls="tsd-search-results" aria-autocomplete="list" aria-expanded="true" autocapitalize="off" autocomplete="off" placeholder="Search the docs" maxLength="100"/><ul role="listbox" id="tsd-search-results"></ul><div id="tsd-search-status" aria-live="polite" aria-atomic="true"><div>Preparing search index...</div></div></dialog><a href="#" class="tsd-widget menu" id="tsd-toolbar-menu-trigger" data-toggle="menu" aria-label="Menu"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><use href="assets/icons.svg#icon-menu"></use></svg></a></div></header><div class="container container-main"><div class="col-content"><div class="tsd-page-title"><h1>llamacpp-ui-metrics-extension</h1></div><div class="tsd-panel tsd-typography"><h1 id="llamacpp-ui-metrics-chrome-extension" class="tsd-anchor-link">llama.cpp UI Metrics (Chrome Extension)<a href="#llamacpp-ui-metrics-chrome-extension" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h1>
+<p>Manifest V3 extension that captures llama.cpp-style streaming metrics from browser UIs that call <code>POST /v1/chat/completions</code> over SSE. Docs: <a href="https://mwiater.github.io/llamacpp-ui-metrics-extension/">https://mwiater.github.io/llamacpp-ui-metrics-extension/</a></p>
+<h2 id="table-of-contents" class="tsd-anchor-link">Table of contents<a href="#table-of-contents" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<ul>
+<li><a href="#what-it-does">What it does</a></li>
+<li><a href="#capture-scope">Capture scope</a></li>
+<li><a href="#completion-boundary-logic">Completion boundary logic</a></li>
+<li><a href="#session-model">Session model</a></li>
+<li><a href="#dashboard-in-page">Dashboard (in-page)</a></li>
+<li><a href="#popup-extension-action">Popup (extension action)</a></li>
+<li><a href="#allowed-domains">Allowed domains</a></li>
+<li><a href="#install-chrome-unpacked">Install (Chrome, unpacked)</a></li>
+<li><a href="#development">Development</a></li>
+<li><a href="#file-layout">File layout</a></li>
+<li><a href="#privacy">Privacy</a></li>
+<li><a href="#known-limitations">Known limitations</a></li>
+</ul>
+<h2 id="what-it-does" class="tsd-anchor-link">What it does<a href="#what-it-does" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<ul>
+<li>Hooks <code>window.fetch()</code> in page context (no DOM scraping for model output)</li>
+<li>Watches streamed <code>text/event-stream</code> responses and parses <code>data:</code> chunks</li>
+<li>Captures one record per completed response into IndexedDB</li>
+<li>Exports current session records as JSONL</li>
+<li>Exports the in-page dashboard as a stitched PNG (full scroll capture)</li>
+<li>Supports <code>Allowed domains</code> management in popup</li>
+<li>Shows <code>Export Permissions</code> status in popup and can request active-site access for PNG export</li>
+<li>Supports <code>Debug logging</code> toggle in popup</li>
+<li>Renders an in-page metrics dashboard (<code>Metrics</code> tab injected on allowlisted hosts)</li>
+</ul>
+<h2 id="capture-scope" class="tsd-anchor-link">Capture scope<a href="#capture-scope" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>Per-record fields are best effort and include:</p>
+<ul>
+<li>Request metadata:
+<ul>
+<li>model, generation params, body bytes, message counts/sizes</li>
+<li>image signals (<code>req.has_images</code>, <code>req.images_bytes</code>, per-part image info)</li>
+<li>document/file attach signals (PDF/text detection + recent file names)</li>
+</ul>
+</li>
+<li>Response metadata:
+<ul>
+<li>completion id/model/fingerprint</li>
+<li>timings and token counters from streamed chunks</li>
+<li>finish reason</li>
+</ul>
+</li>
+<li>Derived split metrics:
+<ul>
+<li>reasoning vs content split when <code>delta.reasoning_content</code> appears before completion</li>
+</ul>
+</li>
+</ul>
+<p>Notes:</p>
+<ul>
+<li>Extension tracks <code>choices[0]</code> only.</li>
+<li>If <code>delta.reasoning_content</code> is absent, reasoning split fields are null/zero as expected.</li>
+</ul>
+<h2 id="completion-boundary-logic" class="tsd-anchor-link">Completion boundary logic<a href="#completion-boundary-logic" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>A record is emitted when the stream reaches completion with usable timing data:</p>
+<ul>
+<li>Primary path: chunk with <code>choices[0].finish_reason</code> and <code>timings</code></li>
+<li>Fallback path: <code>[DONE]</code> marker + last timed chunk</li>
+</ul>
+<p>If no timed completion chunk is found, no record is emitted.</p>
+<h2 id="session-model" class="tsd-anchor-link">Session model<a href="#session-model" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<ul>
+<li>Single active session at a time</li>
+<li><code>Export JSONL</code> exports active session only</li>
+<li><code>Export PNG</code> captures the current dashboard view (including current filters/theme)</li>
+<li><code>Clear all</code> removes all stored records and resets active session</li>
+</ul>
+<p>Export filename format:</p>
+<ul>
+<li><code>llamacpp-metrics_&lt;sessionId&gt;.jsonl</code></li>
+</ul>
+<h2 id="dashboard-in-page" class="tsd-anchor-link">Dashboard (in-page)<a href="#dashboard-in-page" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>On allowlisted hosts, a <code>Metrics</code> button is injected into the page.</p>
+<ul>
+<li>Open overlay for a full-width infographic dashboard, rankings, comparisons, scatter plots, and per-model analysis</li>
+<li>Input-mode and model filters apply across all dashboard sections</li>
+<li>Refresh, theme toggle, JSONL export, and PNG export are built in</li>
+<li>Overlay can be minimized and closed with <code>Esc</code></li>
+</ul>
+<h3 id="dashboard-screenshots" class="tsd-anchor-link">Dashboard screenshots<a href="#dashboard-screenshots" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<p>Light theme example:</p>
+<p><img src="media/llamacpp-ui-metrics-dashboard-light.png" alt="llama.cpp dashboard (light)"></p>
+<h3 id="dashboard-header-buttons" class="tsd-anchor-link">Dashboard header buttons<a href="#dashboard-header-buttons" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<p>The dashboard header includes the following controls:</p>
+<ul>
+<li><code>Dark</code> (theme toggle): switches between light and dark dashboard themes (when dark mode is active, the button label changes to <code>Light</code>)</li>
+<li><code>Export JSONL</code>: exports the current active session records as JSONL</li>
+<li><code>Export PNG</code>: captures the current dashboard view as a stitched PNG image</li>
+<li><code>Refresh</code>: reloads dashboard stats from the extension's stored session data</li>
+<li><code>Minimize</code>: collapses/hides the overlay without closing the injected dashboard entry point</li>
+</ul>
+<h2 id="popup-extension-action" class="tsd-anchor-link">Popup (extension action)<a href="#popup-extension-action" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>The popup includes:</p>
+<ul>
+<li>Session stats (start time, record count, storage size)</li>
+<li>Allowed domain management (<code>example.com</code>, <code>*.example.com</code>, etc.)</li>
+<li><code>Export Permissions</code> panel for PNG export:
+<ul>
+<li>Checks active-site access status</li>
+<li><code>Grant access to this site</code> button (when requestable)</li>
+<li>Fallback guidance to set Chrome extension Site Access to <code>On all sites</code></li>
+</ul>
+</li>
+<li>Debug logging toggle</li>
+<li>Import JSONL / Clear all actions</li>
+</ul>
+<h3 id="popup-settings-screenshot" class="tsd-anchor-link">Popup / settings screenshot<a href="#popup-settings-screenshot" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<p><img src="media/llamacpp-ui-metrics-settings.png" alt="popup settings and session view"></p>
+<h3 id="popup-fields-and-settings-what-each-item-does" class="tsd-anchor-link">Popup fields and settings (what each item does)<a href="#popup-fields-and-settings-what-each-item-does" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<ul>
+<li><code>Session start</code>: the active session ID (timestamp-based) used for new captures and exports</li>
+<li><code>Records</code>: count of captured completion records in the active session</li>
+<li><code>Storage size</code>: estimated local storage size of the active session data</li>
+<li><code>Allowed domains</code>: host allowlist controlling where capture/dashboard injection is enabled</li>
+<li>Domain input field: enter a host pattern such as <code>example.com</code>, <code>localhost:8080</code>, or <code>*.example.com</code></li>
+<li><code>Add</code> button: adds the typed domain pattern to the allowlist</li>
+<li>Domain list: shows all configured allowed-domain patterns</li>
+<li><code>Remove</code> (per row): removes that domain pattern from the allowlist</li>
+<li><code>Export Permissions</code> panel: status area for current-tab site access required by dashboard PNG export</li>
+<li><code>Active site</code> line: shows the current tab origin permission pattern (for example <code>https://example.com/*</code>) when available</li>
+<li>Permission status/details text: explains whether access is available, missing, or not requestable (for example on <code>chrome://</code> pages)</li>
+<li><code>Grant access to this site</code>: requests optional host permission for the active tab's origin</li>
+<li><code>Debug logging</code> toggle: enables verbose logs/probes across background/content/injected layers</li>
+<li><code>Import JSONL</code>: imports records from a JSONL file and overwrites current stored data (after confirmation)</li>
+<li><code>Clear all</code>: deletes all stored records and resets the active session (after confirmation)</li>
+<li>Status message area: shows action feedback and errors (domain added, import status, permission result, etc.)</li>
+</ul>
+<h2 id="allowed-domains" class="tsd-anchor-link">Allowed domains<a href="#allowed-domains" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>Configure in popup (<code>Allowed domains</code>):</p>
+<ul>
+<li><code>example.com</code></li>
+<li><code>localhost:8080</code></li>
+<li><code>*.example.com</code></li>
+</ul>
+<p>Capture starts only when current page host matches one of these patterns. Refresh open tabs after allowlist changes.</p>
+<h2 id="install-chrome-unpacked" class="tsd-anchor-link">Install (Chrome, unpacked)<a href="#install-chrome-unpacked" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<h3 id="load-the-extension-in-chrome-" class="tsd-anchor-link">Load the extension in Chrome (<code>Load unpacked</code> + <code>Developer mode</code>)<a href="#load-the-extension-in-chrome-" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<ol>
+<li>Open Chrome and go to <code>chrome://extensions</code></li>
+<li>Turn on <code>Developer mode</code> (top-right)</li>
+<li>Click <code>Load unpacked</code></li>
+<li>Select this project folder (the folder containing <code>manifest.json</code>)</li>
+<li>Confirm the extension appears in the Chrome extensions list</li>
+</ol>
+<h3 id="first-time-setup-usage" class="tsd-anchor-link">First-time setup / usage<a href="#first-time-setup-usage" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<ol>
+<li>Open your target llama.cpp WebUI (or another compatible UI that streams from <code>POST /v1/chat/completions</code>)</li>
+<li>Click the extension icon to open the popup</li>
+<li>Add the site host to <code>Allowed domains</code> (for example <code>localhost:8080</code>)</li>
+<li>Refresh the target tab so the page hook and dashboard UI can be injected</li>
+<li>Run one or more completions in the UI</li>
+<li>Open the injected <code>Metrics</code> button/tab on the page to view the dashboard</li>
+<li>Use popup or dashboard export buttons (<code>Export JSONL</code>, <code>Export PNG</code>) as needed</li>
+</ol>
+<p>If PNG export fails with a capture permission error:</p>
+<ol>
+<li>Open the extension popup</li>
+<li>Check <code>Export Permissions</code></li>
+<li>Grant access to the current site (if prompted)</li>
+<li>Reload the page and reopen the dashboard</li>
+</ol>
+<p>Alternative: set the extension's Chrome <code>Site Access</code> to <code>On all sites</code> in Chrome's extension details.</p>
+<h2 id="development" class="tsd-anchor-link">Development<a href="#development" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<h3 id="run-tests" class="tsd-anchor-link">Run tests<a href="#run-tests" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<p>A lightweight Node test suite covers high-value pure helper functions across the extension scripts (no Chrome runtime or Playwright setup required).</p>
+<ul>
+<li>Run directly: <code>node --test &quot;tests/*.test.cjs&quot;</code></li>
+<li>Run via package script: <code>npm test</code></li>
+</ul>
+<p>Current suite includes helper coverage for <code>background.js</code> (chain heuristics, dashboard aggregation, scenario comparisons), plus pure helper logic in <code>content.js</code>, <code>injected.js</code>, and <code>popup.js</code>.</p>
+<h3 id="generate-api-docs-with-typedoc" class="tsd-anchor-link">Generate API docs with TypeDoc<a href="#generate-api-docs-with-typedoc" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h3>
+<p>This repo now includes <code>typedoc</code>, <code>typescript</code>, and <code>@types/chrome</code> as dev dependencies, plus a <code>tsconfig.json</code> configured for JavaScript + JSDoc (<code>allowJs</code>) and Chrome extension typings.</p>
+<p>Install dependencies first:</p>
+<ul>
+<li><code>npm install --save-dev typedoc typescript @types/chrome</code></li>
+<li>or, if dependencies are already in <code>package.json</code>: <code>npm install</code></li>
+</ul>
+<p>TypeDoc command for this project (current layout):</p>
+<ul>
+<li><code>npm run docs:typedoc:current</code></li>
+<li>or <code>npx typedoc --entryPoints background.js --entryPoints content.js --entryPoints injected.js --entryPoints popup.js --excludeInternal</code></li>
+</ul>
+<p>What the command does:</p>
+<ul>
+<li><code>npx typedoc</code>: runs the local TypeDoc binary from your project dependencies (with TypeScript compiler support from <code>typescript</code>)</li>
+<li><code>--entryPoints ...</code>: explicitly documents the extension's top-level JavaScript files as entry points</li>
+<li><code>--excludeInternal</code>: hides symbols marked with <code>@internal</code> (used for implementation-only helpers/state)</li>
+</ul>
+<p>TypeDoc writes HTML output to <code>./docs</code> by default (unless you pass <code>--out</code>).</p>
+<p>Chrome extension API JSDoc references resolve better when <code>@types/chrome</code> is installed and <code>tsconfig.json</code> includes <code>&quot;types&quot;: [&quot;chrome&quot;]</code>.</p>
+<p>Note: file headers use TypeDoc-friendly <code>@module</code> comments (instead of JSDoc <code>@file</code> / <code>@description</code>) to avoid unknown-tag warnings.</p>
+<p>Many helper functions and module-scoped state values are intentionally marked <code>@internal</code> so published docs stay focused on the most useful symbols.</p>
+<h2 id="file-layout" class="tsd-anchor-link">File layout<a href="#file-layout" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>Core extension files:</p>
+<ul>
+<li><code>manifest.json</code></li>
+<li><code>background.js</code></li>
+<li><code>content.js</code></li>
+<li><code>injected.js</code></li>
+<li><code>popup.html</code></li>
+<li><code>popup.js</code></li>
+<li><code>popup.css</code></li>
+</ul>
+<p>Documentation and assets:</p>
+<ul>
+<li><code>README.md</code></li>
+<li><code>.screens/</code> (README screenshots)</li>
+<li><code>docs/</code> (generated TypeDoc HTML output, if created)</li>
+</ul>
+<p>Development files:</p>
+<ul>
+<li><code>package.json</code></li>
+<li><code>package-lock.json</code></li>
+<li><code>tsconfig.json</code></li>
+<li><code>tests/function-loader.cjs</code></li>
+<li><code>tests/helpers.test.cjs</code></li>
+<li><code>tests/background-aggregation.test.cjs</code></li>
+</ul>
+<h2 id="privacy" class="tsd-anchor-link">Privacy<a href="#privacy" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<p>Data is stored locally in browser IndexedDB and exported only when user clicks export.</p>
+<p>By default, full prompt/output text is not intentionally persisted as primary payload; captured data focuses on metrics, request shape, and timing/token fields.</p>
+<h2 id="known-limitations" class="tsd-anchor-link">Known limitations<a href="#known-limitations" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h2>
+<ul>
+<li>Handles <code>choices[0]</code> only</li>
+<li>Designed for SSE (<code>content-type</code> includes <code>text/event-stream</code>)</li>
+<li>Request body parsing works best when <code>fetch(..., { body: JSON.stringify(...) })</code></li>
+<li>PNG export depends on Chrome tab capture permissions/site access and may require granting access + page reload</li>
+</ul>
+</div></div><div class="col-sidebar"><div class="page-menu"><div class="tsd-navigation settings"><details class="tsd-accordion"><summary class="tsd-accordion-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="assets/icons.svg#icon-chevronDown"></use></svg><h3>Settings</h3></summary><div class="tsd-accordion-details"><div class="tsd-filter-visibility"><span class="settings-label">Member Visibility</span><ul id="tsd-filter-options"><li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-protected" name="protected"/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>Protected</span></label></li><li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-inherited" name="inherited" checked/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>Inherited</span></label></li><li class="tsd-filter-item"><label class="tsd-filter-input"><input type="checkbox" id="tsd-filter-external" name="external"/><svg width="32" height="32" viewBox="0 0 32 32" aria-hidden="true"><rect class="tsd-checkbox-background" width="30" height="30" x="1" y="1" rx="6" fill="none"></rect><path class="tsd-checkbox-checkmark" d="M8.35422 16.8214L13.2143 21.75L24.6458 10.25" stroke="none" stroke-width="3.5" stroke-linejoin="round" fill="none"></path></svg><span>External</span></label></li></ul></div><div class="tsd-theme-toggle"><label class="settings-label" for="tsd-theme">Theme</label><select id="tsd-theme"><option value="os">OS</option><option value="light">Light</option><option value="dark">Dark</option></select></div></div></details></div><details open class="tsd-accordion tsd-page-navigation"><summary class="tsd-accordion-summary"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true"><use href="assets/icons.svg#icon-chevronDown"></use></svg><h3>On This Page</h3></summary><div class="tsd-accordion-details"><a href="#llamacpp-ui-metrics-chrome-extension"><span>llama.cpp <wbr/>UI <wbr/>Metrics (<wbr/>Chrome <wbr/>Extension)</span></a><ul><li><a href="#table-of-contents"><span>Table of contents</span></a></li><li><a href="#what-it-does"><span>What it does</span></a></li><li><a href="#capture-scope"><span>Capture scope</span></a></li><li><a href="#completion-boundary-logic"><span>Completion boundary logic</span></a></li><li><a href="#session-model"><span>Session model</span></a></li><li><a href="#dashboard-in-page"><span>Dashboard (in-<wbr/>page)</span></a></li><li><ul><li><a href="#dashboard-screenshots"><span>Dashboard screenshots</span></a></li><li><a href="#dashboard-header-buttons"><span>Dashboard header buttons</span></a></li></ul></li><li><a href="#popup-extension-action"><span>Popup (extension action)</span></a></li><li><ul><li><a href="#popup-settings-screenshot"><span>Popup / settings screenshot</span></a></li><li><a href="#popup-fields-and-settings-what-each-item-does"><span>Popup fields and settings (what each item does)</span></a></li></ul></li><li><a href="#allowed-domains"><span>Allowed domains</span></a></li><li><a href="#install-chrome-unpacked"><span>Install (<wbr/>Chrome, unpacked)</span></a></li><li><ul><li><a href="#load-the-extension-in-chrome-"><span>Load the extension in <wbr/>Chrome ( + )</span></a></li><li><a href="#first-time-setup-usage"><span>First-<wbr/>time setup / usage</span></a></li></ul></li><li><a href="#development"><span>Development</span></a></li><li><ul><li><a href="#run-tests"><span>Run tests</span></a></li><li><a href="#generate-api-docs-with-typedoc"><span>Generate <wbr/>API docs with <wbr/>Type<wbr/>Doc</span></a></li></ul></li><li><a href="#file-layout"><span>File layout</span></a></li><li><a href="#privacy"><span>Privacy</span></a></li><li><a href="#known-limitations"><span>Known limitations</span></a></li></ul></div></details></div><div class="site-menu"><nav class="tsd-navigation"><a href="modules.html">llamacpp-ui-metrics-extension</a><ul class="tsd-small-nested-navigation" id="tsd-nav-container"><li>Loading...</li></ul></nav></div></div></div><footer><p class="tsd-generator">Generated using <a href="https://typedoc.org/" target="_blank">TypeDoc</a></p></footer><div class="overlay"></div></body></html>
