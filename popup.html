@@ -1,0 +1,67 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Llama.cpp UI Metrics</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="wrap">
+    <h1>Llama.cpp UI Metrics</h1>
+
+    <div class="row">
+      <div class="label">Session Start</div>
+      <div class="value" id="sessionStart">...</div>
+    </div>
+
+    <div class="row">
+      <div class="label">Session Records</div>
+      <div class="value" id="sessionRecords">...</div>
+    </div>
+
+    <div class="row">
+      <div class="label">Session Size</div>
+      <div class="value" id="sessionSize">...</div>
+    </div>
+
+    <div class="row domain-row">
+      <div class="label domain-label">Allowed domains</div>
+      <div class="domain-controls">
+        <input id="domainInput" type="text" placeholder="example.com or *.example.com" />
+        <button id="addDomainBtn">Add</button>
+      </div>
+    </div>
+
+    <div id="domainList" class="domain-list"></div>
+
+    <div class="panel permissions-panel">
+      <div class="panel-title">Export Permissions</div>
+      <div class="panel-note panel-note-tight">
+        This site access is used for PNG export of the dashboard (screen capture).
+      </div>
+      <div id="permSite" class="panel-line mono">Checking active site...</div>
+      <div id="permState" class="panel-line">Checking access...</div>
+      <button id="grantSiteAccessBtn" type="button">Grant access to this site</button>
+      <div class="panel-note">
+        If this still fails, open Chrome extension details and set Site Access to <strong>On all sites</strong>.
+      </div>
+    </div>
+
+    <div class="row">
+      <label class="label checkbox">
+        <input type="checkbox" id="debugToggle" />
+        Debug logging
+      </label>
+    </div>
+
+    <div class="buttons">
+      <button id="importBtn" class="danger">Import JSONL</button>
+      <button id="clearAllBtn" class="danger">Clear all</button>
+    </div>
+
+    <div id="status" class="status"></div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

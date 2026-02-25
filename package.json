@@ -1,0 +1,16 @@
+{
+  "name": "llamacpp-ui-metrics-extension",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Chrome extension for capturing llama.cpp UI streaming metrics",
+  "scripts": {
+    "test": "node --test \"tests/*.test.cjs\"",
+    "docs:typedoc": "typedoc --entryPointStrategy expand ./src --excludeInternal",
+    "docs:typedoc:current": "typedoc --entryPoints background.js --entryPoints content.js --entryPoints injected.js --entryPoints popup.js --excludeInternal"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.1.37",
+    "typedoc": "^0.28.17",
+    "typescript": "^5.9.3"
+  }
+}
