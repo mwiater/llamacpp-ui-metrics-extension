@@ -349,11 +349,11 @@ function parseJsonlText(text) {
 }
 
 document.getElementById("importBtn").addEventListener("click", async () => {
-  const ok = confirm("Import JSONL will overwrite all metrics currently stored in this browser. Continue?");
-  if (!ok) return;
   try {
     const file = await pickJsonlFile();
     if (!file) return;
+    const ok = confirm("Import JSONL will overwrite all metrics currently stored in this browser. Continue?");
+    if (!ok) return;
     setStatus("Validating JSONL...");
     const text = await file.text();
     const records = parseJsonlText(text);

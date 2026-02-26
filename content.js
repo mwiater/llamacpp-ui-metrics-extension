@@ -573,6 +573,255 @@ function perfSpeedBarRow(label, value, unit, pct, color, valueClass = "val", bad
 }
 
 /**
+ * Perf Build Document Ingestion Rows.
+ */
+function perfBuildDocumentIngestionRows(records) {
+  const byModel = new Map();
+  for (const r of records || []) {
+    const model = r?.model || "unknown";
+    if (!byModel.has(model)) byModel.set(model, []);
+    byModel.get(model).push(r);
+  }
+
+  const rows = [];
+  let colorIdx = 0;
+  for (const [model, arr] of Array.from(byModel.entries()).sort((a, b) => a[0].localeCompare(b[0]))) {
+    const textRows = arr.filter((r) => (r?.input_mode || "unknown") === "text_only");
+    const fileRows = arr.filter((r) => {
+      const mode = String(r?.input_mode || "");
+      const legacyFallback = (r?.document_detected === null || typeof r?.document_detected === "undefined") && r?.has_files === true;
+      return mode.includes("file") && (r?.document_detected === true || legacyFallback);
+    });
+    if (!fileRows.length) continue;
+
+    const textTtftVals = textRows.map((r) => toFiniteNumber(r?.ttft_ms)).filter((x) => x !== null);
+    const textMsPerTokenVals = textRows.map((r) => {
+      const predMs = toFiniteNumber(r?.predicted_ms);
+      const predN = toFiniteNumber(r?.predicted_n);
+      if (predMs === null || predN === null || predN <= 0) return null;
+      return predMs / predN;
+    }).filter((x) => x !== null);
+    const textTtftBaseline = median(textTtftVals);
+    const textMsPerTokenBaseline = median(textMsPerTokenVals);
+
+    const textByPromptHash = new Map();
+    for (const tr of textRows) {
+      const hash = tr?.prompt_hash || null;
+      const ttft = toFiniteNumber(tr?.ttft_ms);
+      if (!hash || ttft === null) continue;
+      if (!textByPromptHash.has(hash)) textByPromptHash.set(hash, []);
+      textByPromptHash.get(hash).push(ttft);
+    }
+
+    const docMsPerMbVals = [];
+    const ttftDeltaVals = [];
+    const fileMsPerTokenVals = [];
+    const fileBytesVals = [];
+    let baselineExactCount = 0;
+    let baselineModelCount = 0;
+
+    for (const fr of fileRows) {
+      const fileBytes = toFiniteNumber(fr?.file_bytes_total);
+      const promptMs = toFiniteNumber(fr?.prompt_ms);
+      const ttft = toFiniteNumber(fr?.ttft_ms);
+      const predMs = toFiniteNumber(fr?.predicted_ms);
+      const predN = toFiniteNumber(fr?.predicted_n);
+      if (fileBytes !== null && fileBytes > 0) fileBytesVals.push(fileBytes);
+      if (promptMs !== null && fileBytes !== null && fileBytes > 0) {
+        docMsPerMbVals.push(promptMs / (fileBytes / 1_000_000));
+      }
+      if (predMs !== null && predN !== null && predN > 0) {
+        fileMsPerTokenVals.push(predMs / predN);
+      }
+      if (ttft !== null) {
+        const hash = fr?.prompt_hash || null;
+        const exact = hash && textByPromptHash.has(hash) ? median(textByPromptHash.get(hash)) : null;
+        const baseline = (typeof exact === "number") ? exact : textTtftBaseline;
+        if (typeof baseline === "number") {
+          ttftDeltaVals.push(ttft - baseline);
+          if (typeof exact === "number") baselineExactCount += 1;
+          else baselineModelCount += 1;
+        }
+      }
+    }
+
+    rows.push({
+      model,
+      short: shortenModelName(model.replace(/-Q\d.*$/i, ""), 18),
+      color: perfColorByIndex(colorIdx++),
+      file_run_count: fileRows.length,
+      file_bytes_median_mb: (() => {
+        const v = median(fileBytesVals);
+        return typeof v === "number" ? (v / 1_000_000) : null;
+      })(),
+      doc_ms_per_mb: median(docMsPerMbVals),
+      ttft_delta_ms: median(ttftDeltaVals),
+      ttft_delta_count: ttftDeltaVals.length,
+      baseline_exact_count: baselineExactCount,
+      baseline_model_count: baselineModelCount,
+      ms_per_output_token_file: median(fileMsPerTokenVals),
+      ms_per_output_token_text: textMsPerTokenBaseline,
+      output_efficiency_delta_pct: (() => {
+        const f = median(fileMsPerTokenVals);
+        const t = textMsPerTokenBaseline;
+        if (typeof f !== "number" || typeof t !== "number" || t <= 0) return null;
+        return ((f - t) / t) * 100;
+      })(),
+      file_kind_set: uniqueValues(fileRows.map((r) => r?.file_kind_set || "none")).join(", "),
+      file_size_bucket_set: uniqueValues(fileRows.map((r) => r?.file_size_bucket || "unknown")).join(", ")
+    });
+  }
+
+  return rows;
+}
+
+/**
+ * Perf Doc Tone Class.
+ */
+function perfDocToneClass(index, total) {
+  const n = Math.max(1, total | 0);
+  if (n <= 2) return index === 0 ? "good" : "warn";
+  const p = index / Math.max(1, n - 1);
+  if (p <= 0.33) return "good";
+  if (p <= 0.66) return "mid";
+  return "warn";
+}
+
+/**
+ * Perf Render Document Ingestion Card.
+ */
+function perfRenderDocumentIngestionCard(records) {
+  const rows = perfBuildDocumentIngestionRows(records);
+  if (!rows.length) {
+    return `
+      <div class="card-panel full-width">
+        <h3 class="dark-header">DOCUMENT INGESTION EFFICIENCY INDEX</h3>
+        <div class="sub-label">Compares file-ingestion cost, startup delay inflation, and post-ingestion output efficiency for document-attached runs.</div>
+        <div class="llm-empty">No document-attached runs detected for the current filters.</div>
+      </div>
+    `;
+  }
+
+  const ingestionRows = [...rows]
+    .filter((r) => typeof r.doc_ms_per_mb === "number")
+    .sort((a, b) => a.doc_ms_per_mb - b.doc_ms_per_mb);
+  const ingestionMax = Math.max(...ingestionRows.map((r) => r.doc_ms_per_mb || 0), 1);
+  const ttftRows = [...rows]
+    .filter((r) => typeof r.ttft_delta_ms === "number")
+    .sort((a, b) => a.ttft_delta_ms - b.ttft_delta_ms);
+  const ttftAbsMax = Math.max(...ttftRows.map((r) => Math.abs(r.ttft_delta_ms || 0)), 1);
+  const outputRows = [...rows]
+    .filter((r) => typeof r.ms_per_output_token_file === "number" || typeof r.ms_per_output_token_text === "number")
+    .sort((a, b) => (a.ms_per_output_token_file ?? Infinity) - (b.ms_per_output_token_file ?? Infinity));
+  const outputMax = Math.max(...outputRows.flatMap((r) => [r.ms_per_output_token_file || 0, r.ms_per_output_token_text || 0]), 1);
+
+  const ingestionHtml = ingestionRows.length
+    ? ingestionRows.map((r, i) => {
+      const cls = perfDocToneClass(i, ingestionRows.length);
+      const pct = ((r.doc_ms_per_mb || 0) / ingestionMax) * 100;
+      const medal = i < 3 ? ["🥇 ", "🥈 ", "🥉 "][i] : "";
+      return `
+        <div class="doc-metric-row">
+          <div class="doc-row-head">
+            <span class="doc-name"><span class="color-dot" style="background:${r.color}"></span>${medal}${escapeHtml(r.short)}</span>
+            <span class="doc-value">${formatNumber(r.doc_ms_per_mb, 0)} ms/MB</span>
+          </div>
+          <div class="doc-track"><div class="doc-fill ${cls}" style="width:${formatNumber(pct, 1)}%"></div></div>
+          <div class="doc-meta">${formatInt(r.file_run_count)} runs · median file ${formatNumber(r.file_bytes_median_mb, 2)} MB</div>
+        </div>
+      `;
+    }).join("")
+    : `<div class="llm-empty">No valid prompt/file size timing pairs.</div>`;
+
+  const ttftHtml = ttftRows.length
+    ? ttftRows.map((r) => {
+      const delta = r.ttft_delta_ms || 0;
+      const magPct = (Math.abs(delta) / ttftAbsMax) * 50;
+      const left = delta < 0 ? (50 - magPct) : 50;
+      const cls = delta < 0 ? "good" : (delta > 0 ? "warn" : "mid");
+      const baselineLabel = r.baseline_exact_count > 0
+        ? (r.baseline_model_count > 0 ? `mixed baseline (${r.baseline_exact_count} exact)` : "prompt-hash baseline")
+        : "model baseline";
+      return `
+        <div class="doc-metric-row">
+          <div class="doc-row-head">
+            <span class="doc-name"><span class="color-dot" style="background:${r.color}"></span>${escapeHtml(r.short)}</span>
+            <span class="doc-value ${delta < 0 ? "val-green" : delta > 0 ? "val-warn" : "val"}">${delta >= 0 ? "+" : ""}${formatNumber(delta, 0)} ms</span>
+          </div>
+          <div class="doc-delta-track">
+            <div class="doc-delta-zero"></div>
+            <div class="doc-delta-fill ${cls}" style="left:${formatNumber(left, 1)}%;width:${formatNumber(magPct, 1)}%"></div>
+          </div>
+          <div class="doc-meta">${baselineLabel} · ${formatInt(r.ttft_delta_count)} comparable runs</div>
+        </div>
+      `;
+    }).join("")
+    : `<div class="llm-empty">No text-only baseline available for TTFT delta.</div>`;
+
+  const outputHtml = outputRows.length
+    ? outputRows.map((r) => {
+      const f = r.ms_per_output_token_file;
+      const t = r.ms_per_output_token_text;
+      const filePct = typeof f === "number" ? (f / outputMax) * 100 : 0;
+      const textPct = typeof t === "number" ? (t / outputMax) * 100 : 0;
+      const deltaPct = r.output_efficiency_delta_pct;
+      return `
+        <div class="doc-metric-row">
+          <div class="doc-row-head">
+            <span class="doc-name"><span class="color-dot" style="background:${r.color}"></span>${escapeHtml(r.short)}</span>
+            <span class="doc-value">${typeof f === "number" ? `${formatNumber(f, 2)} ms/tok` : "-"}</span>
+          </div>
+          <div class="doc-dual-bars">
+            <div class="doc-dual-line">
+              <span class="doc-dual-label">Text</span>
+              <div class="doc-track"><div class="doc-fill neutral" style="width:${formatNumber(textPct, 1)}%"></div></div>
+              <span class="doc-dual-value">${typeof t === "number" ? formatNumber(t, 2) : "-"}</span>
+            </div>
+            <div class="doc-dual-line">
+              <span class="doc-dual-label">File</span>
+              <div class="doc-track"><div class="doc-fill blue" style="width:${formatNumber(filePct, 1)}%"></div></div>
+              <span class="doc-dual-value">${typeof f === "number" ? formatNumber(f, 2) : "-"}</span>
+            </div>
+          </div>
+          <div class="doc-meta">${typeof deltaPct === "number" ? `${deltaPct >= 0 ? "+" : ""}${formatNumber(deltaPct, 1)}% vs text baseline` : "No text-only output-speed baseline"}</div>
+        </div>
+      `;
+    }).join("")
+    : `<div class="llm-empty">No output timing data available for document runs.</div>`;
+
+  const bestIngestion = ingestionRows[0] || null;
+  const bestTtft = [...ttftRows].sort((a, b) => (a.ttft_delta_ms || 0) - (b.ttft_delta_ms || 0))[0] || null;
+  const stableOutput = [...outputRows]
+    .filter((r) => typeof r.output_efficiency_delta_pct === "number")
+    .sort((a, b) => Math.abs(a.output_efficiency_delta_pct) - Math.abs(b.output_efficiency_delta_pct))[0] || null;
+
+  return `
+    <div class="card-panel full-width" data-panel="document-ingestion-efficiency">
+      <h3 class="dark-header">DOCUMENT INGESTION EFFICIENCY INDEX</h3>
+      <div class="sub-label">Isolates document workflows by comparing ingestion cost per MB, TTFT inflation versus text-only baselines, and post-ingestion output efficiency. Lower values are generally better.</div>
+      <div class="doc-ingestion-grid">
+        <div class="doc-subpanel">
+          <div class="doc-subpanel-title">A. Ingestion Cost per MB</div>
+          <div class="doc-subpanel-sub">Prompt processing cost normalized by file size (ms/MB)</div>
+          <div>${ingestionHtml}</div>
+        </div>
+        <div class="doc-subpanel">
+          <div class="doc-subpanel-title">B. TTFT Inflation (Delta)</div>
+          <div class="doc-subpanel-sub">Document TTFT minus text-only baseline TTFT (ms)</div>
+          <div>${ttftHtml}</div>
+        </div>
+        <div class="doc-subpanel">
+          <div class="doc-subpanel-title">C. Output Efficiency After Ingestion</div>
+          <div class="doc-subpanel-sub">Compare ms/output-token for text-only vs text+file (lower is better)</div>
+          <div>${outputHtml}</div>
+        </div>
+      </div>
+      <div class="takeaway"><strong>DOC TAKEAWAY:</strong> ${bestIngestion ? `${escapeHtml(bestIngestion.short)} leads ingestion at ${formatNumber(bestIngestion.doc_ms_per_mb, 0)} ms/MB.` : "Need more file runs."} ${bestTtft ? `Best startup delta: ${escapeHtml(bestTtft.short)} (${bestTtft.ttft_delta_ms >= 0 ? "+" : ""}${formatNumber(bestTtft.ttft_delta_ms, 0)} ms).` : ""} ${stableOutput ? `Most stable output speed vs text baseline: ${escapeHtml(stableOutput.short)} (${stableOutput.output_efficiency_delta_pct >= 0 ? "+" : ""}${formatNumber(stableOutput.output_efficiency_delta_pct, 1)}%).` : ""}</div>
+    </div>
+  `;
+}
+
+/**
  * Perf Render Scatter Svg.
  */
 function perfRenderScatterSvg(textModels, dims = {}) {
@@ -775,6 +1024,8 @@ function perfRenderDashboardTemplate(records, summary, theme) {
 
   const scatterLegend = textModels.map((m) => `<div class="legend-item"><div class="legend-dot" style="background:${m.color}"></div>${escapeHtml(m.short)}</div>`).join("");
   const scatterSvg = perfRenderScatterSvg(textModels);
+  const docRows = perfBuildDocumentIngestionRows(records);
+  const docIngestionCard = perfRenderDocumentIngestionCard(records);
 
   const topTps = tpsSorted[0];
   const lowTps = tpsSorted[tpsSorted.length - 1];
@@ -782,6 +1033,9 @@ function perfRenderDashboardTemplate(records, summary, theme) {
   const bestTtft = ttftSorted[0] || null;
   const bestEff = effSorted[0] || null;
   const bestStable = stableSorted[0] || null;
+  const bestDocIngestion = [...docRows]
+    .filter((r) => typeof r.doc_ms_per_mb === "number")
+    .sort((a, b) => (a.doc_ms_per_mb || 0) - (b.doc_ms_per_mb || 0))[0] || null;
   const bestInClassCards = [
     {
       section: "THE RACE TO FIRST RESPONSE",
@@ -812,6 +1066,12 @@ function perfRenderDashboardTemplate(records, summary, theme) {
       model: bestStable?.model || "-",
       metric: typeof bestStable?.ttftStd === "number" ? `±${formatNumber(bestStable.ttftStd, 0)}ms` : "-",
       note: "Lowest TTFT-std model"
+    },
+    {
+      section: "DOCUMENT INGESTION",
+      model: bestDocIngestion?.model || "-",
+      metric: typeof bestDocIngestion?.doc_ms_per_mb === "number" ? `${formatNumber(bestDocIngestion.doc_ms_per_mb, 0)} ms/MB` : "-",
+      note: "Lowest ingestion cost per MB"
     }
   ];
   const bestInClassRow = `
@@ -856,14 +1116,14 @@ function perfRenderDashboardTemplate(records, summary, theme) {
           <div class="section-divider"></div>
           <div class="main-grid">
             ${bestInClassRow}
-            <div class="card-panel full-width">
+            <div class="card-panel" data-panel="ttft">
               <h3 class="orange-header">THE RACE TO FIRST RESPONSE</h3>
               <div class="sub-label">Shows time-to-first-token (TTFT) in milliseconds for text models, so compare bar lengths to identify the fastest interactive responders and spot latency outliers.</div>
               <div>${ttftBars}</div>
               <div class="takeaway"><strong>TAKEAWAY:</strong> Fastest text models cluster near ${ttftSorted[0]?.ttft ? `${formatNumber(ttftSorted[0].ttft, 0)}ms` : "-"} TTFT.</div>
             </div>
 
-            <div class="card-panel">
+            <div class="card-panel" data-panel="vision-tax">
               <h3 class="blue-header">THE VISION TAX</h3>
               <div class="sub-label">Compares startup latency for image-enabled requests against text-only behavior, so look for how much vision inputs increase TTFT and whether that penalty remains consistently high.</div>
               <div class="two-col-grid" style="margin-bottom:10px;">${visionTaxBoxes || `<div class="llm-empty">No vision/image runs found.</div>`}</div>
@@ -872,14 +1132,16 @@ function perfRenderDashboardTemplate(records, summary, theme) {
               <div class="takeaway"><strong>${typeof avgTextTtft === "number" ? "VISION COST:" : "NOTE:"}</strong> ${typeof avgTextTtft === "number" ? `Text-only average TTFT is ${formatNumber(avgTextTtft, 0)}ms.` : "Capture image prompts to populate this panel."}</div>
             </div>
 
-            <div class="card-panel">
+            ${docIngestionCard}
+
+            <div class="card-panel" data-panel="reasoning-share">
               <h3 class="orange-header">HOW MUCH DOES IT THINK?</h3>
               <div class="sub-label">Shows the estimated share of generated tokens consumed by internal reasoning phases, so higher bars indicate models spending more output budget thinking before visible answers.</div>
               <div>${reasoningBars}</div>
               <div class="takeaway"><strong>TAKEAWAY:</strong> ${reasoningWinner ? `${escapeHtml(reasoningWinner.short)} leads reasoning share at ${formatNumber(reasoningWinner.reasoningPct, 1)}%.` : "No reasoning models detected in current filter."}</div>
             </div>
 
-            <div class="card-panel">
+            <div class="card-panel" data-panel="tps">
               <h3 class="blue-header">TOKENS PER SECOND</h3>
               <div class="sub-label">Ranks generation throughput in tokens per second (TPS), so compare the leaders for raw speed and note how sharply performance drops across the remaining models.</div>
               <div>${tpsBars}</div>
@@ -898,14 +1160,14 @@ function perfRenderDashboardTemplate(records, summary, theme) {
               </div>
             </div>
 
-            <div class="card-panel">
+            <div class="card-panel" data-panel="size-efficiency">
               <h3 class="blue-header">BIGGER ISN'T ALWAYS BETTER</h3>
               <div class="sub-label">Normalizes throughput by parameter count (TPS per B params) to show size efficiency, so higher bars reveal models delivering more speed per unit of model size.</div>
               <div>${effBars || `<div class="llm-empty">No parseable parameter sizes found.</div>`}</div>
               <div class="takeaway"><strong>TAKEAWAY:</strong> Small and mid-size models often dominate per-parameter efficiency.</div>
             </div>
 
-            <div class="card-panel">
+            <div class="card-panel" data-panel="overall-speed">
               <h3 class="orange-header">OVERALL SPEED COMPARISON</h3>
               <div class="sub-label">Provides a compact all-model TPS ranking, so use it to confirm speed winners quickly and compare the spread between the fastest and slowest performers.</div>
               <div class="two-col-grid" style="margin-bottom:9px;">
@@ -921,7 +1183,7 @@ function perfRenderDashboardTemplate(records, summary, theme) {
               <div>${speedRank}</div>
             </div>
 
-            <div class="card-panel full-width">
+            <div class="card-panel full-width" data-panel="latency-stability">
               <h3 class="dark-header">LATENCY STABILITY — Consistency Under Load</h3>
               <div class="sub-label">Shows TTFT variability as standard deviation in milliseconds, so lower values indicate more predictable response starts while higher values signal unstable latency behavior.</div>
               <div class="stability-grid">
@@ -1680,11 +1942,33 @@ function mountDashboardUi() {
         white-space: nowrap;
       }
       .perf-dashboard .section-divider { height: 2px; background: linear-gradient(90deg, transparent, rgba(192,120,48,0.4), transparent); }
-      .perf-dashboard .main-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 10px; }
-      .perf-dashboard .full-width { grid-column: 1 / -1; }
+      .perf-dashboard .main-grid {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        padding: 10px;
+        align-items: stretch;
+      }
+      .perf-dashboard .main-grid > * {
+        min-width: 0;
+        flex: 1 1 calc(50% - 5px);
+      }
+      .perf-dashboard .full-width { flex-basis: 100% !important; width: 100%; }
+      .perf-dashboard .main-grid > .best-class-row { flex-basis: 100%; width: 100%; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="efficiency-frontier"] { flex-basis: 100%; width: 100%; }
+      .perf-dashboard .main-grid > .best-class-row { order: 10; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="ttft"] { order: 20; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="tps"] { order: 30; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="document-ingestion-efficiency"] { order: 40; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="vision-tax"] { order: 50; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="overall-speed"] { order: 60; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="efficiency-frontier"] { order: 70; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="size-efficiency"] { order: 80; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="reasoning-share"] { order: 90; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="latency-stability"] { order: 100; }
       .perf-dashboard .best-class-row {
         display: grid;
-        grid-template-columns: repeat(5, minmax(0, 1fr));
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
         gap: 8px;
       }
       .perf-dashboard .best-class-card {
@@ -1845,6 +2129,124 @@ function mountDashboardUi() {
       .perf-dashboard .legend-title { font-size:.82rem; font-weight:800; color:var(--accent-primary); margin-bottom:6px; letter-spacing:.6px; font-family: var(--perf-font-head); }
       .perf-dashboard .legend-item { display:flex; align-items:center; gap:6px; font-size:.74rem; color:var(--text-secondary); margin:2px 0; line-height:1.3; font-family: var(--perf-font-body); }
       .perf-dashboard .legend-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; opacity:.85; }
+      .perf-dashboard .doc-ingestion-grid { display:grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+      .perf-dashboard .doc-subpanel {
+        background: var(--bg-inset);
+        border: 1px solid var(--border-color);
+        border-radius: 6px;
+        padding: 9px;
+      }
+      .perf-dashboard .doc-subpanel-title {
+        color: var(--accent-primary);
+        font-size: .76rem;
+        font-weight: 800;
+        letter-spacing: .05em;
+        text-transform: uppercase;
+        font-family: var(--perf-font-head);
+      }
+      .perf-dashboard .doc-subpanel-sub {
+        color: var(--text-muted);
+        font-size: .66rem;
+        line-height: 1.25;
+        margin: 4px 0 7px;
+        font-family: var(--perf-font-body);
+      }
+      .perf-dashboard .doc-metric-row { margin: 5px 0 8px; }
+      .perf-dashboard .doc-row-head {
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap: 8px;
+        font-size: .72rem;
+        margin-bottom: 3px;
+      }
+      .perf-dashboard .doc-name {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: var(--text-secondary);
+        font-family: var(--perf-font-body);
+      }
+      .perf-dashboard .doc-value {
+        flex-shrink: 0;
+        color: var(--text-primary);
+        font-weight: 700;
+        font-size: .68rem;
+        font-family: var(--perf-font-mono);
+      }
+      .perf-dashboard .doc-track {
+        height: 10px;
+        border-radius: 999px;
+        background: var(--bg-bar-track);
+        overflow: hidden;
+        border: 1px solid var(--border-color);
+      }
+      .perf-dashboard .doc-fill {
+        height: 100%;
+        border-radius: 999px;
+        background: var(--accent-primary);
+        opacity: .9;
+      }
+      .perf-dashboard .doc-fill.good { background: var(--accent-positive); }
+      .perf-dashboard .doc-fill.mid { background: var(--accent-gold); }
+      .perf-dashboard .doc-fill.warn { background: var(--accent-warn); }
+      .perf-dashboard .doc-fill.blue { background: var(--accent-secondary); }
+      .perf-dashboard .doc-fill.neutral { background: color-mix(in srgb, var(--text-secondary) 65%, transparent); }
+      .perf-dashboard .doc-meta {
+        margin-top: 3px;
+        color: var(--text-muted);
+        font-size: .62rem;
+        line-height: 1.2;
+        font-family: var(--perf-font-body);
+      }
+      .perf-dashboard .doc-delta-track {
+        position: relative;
+        height: 12px;
+        border-radius: 4px;
+        background: var(--bg-bar-track);
+        border: 1px solid var(--border-color);
+        overflow: hidden;
+      }
+      .perf-dashboard .doc-delta-zero {
+        position:absolute;
+        left:50%;
+        top:0;
+        bottom:0;
+        width:1px;
+        background: var(--border-accent);
+      }
+      .perf-dashboard .doc-delta-fill {
+        position:absolute;
+        top:1px;
+        bottom:1px;
+        border-radius: 3px;
+        opacity: .92;
+        background: var(--accent-gold);
+      }
+      .perf-dashboard .doc-delta-fill.good { background: var(--accent-positive); }
+      .perf-dashboard .doc-delta-fill.mid { background: var(--accent-gold); }
+      .perf-dashboard .doc-delta-fill.warn { background: var(--accent-warn); }
+      .perf-dashboard .doc-dual-bars { display:grid; gap: 3px; }
+      .perf-dashboard .doc-dual-line {
+        display:grid;
+        grid-template-columns: 28px 1fr 44px;
+        gap: 6px;
+        align-items: center;
+      }
+      .perf-dashboard .doc-dual-label {
+        font-size: .62rem;
+        color: var(--text-muted);
+        text-transform: uppercase;
+        letter-spacing: .04em;
+        font-family: var(--perf-font-head);
+      }
+      .perf-dashboard .doc-dual-value {
+        text-align: right;
+        font-size: .62rem;
+        color: var(--text-secondary);
+        font-family: var(--perf-font-mono);
+      }
       .perf-dashboard .stability-grid { display:grid; grid-template-columns: 1fr 1fr; gap: 16px; }
       .perf-dashboard .stab-title { font-size:.78rem; font-weight:700; margin-bottom:6px; letter-spacing:.4px; font-family: var(--perf-font-head); }
       .perf-dashboard .stab-title.good { color: var(--accent-positive); }
@@ -1865,10 +2267,10 @@ function mountDashboardUi() {
         .ig3-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         .ig5-header { grid-template-columns: 1fr; }
         .ig5-finding { width: auto; }
-        .perf-dashboard .main-grid { grid-template-columns: 1fr; }
-        .perf-dashboard .full-width { grid-column: 1; }
+        .perf-dashboard .main-grid > * { flex-basis: 100%; }
         .perf-dashboard .best-class-row { grid-template-columns: 1fr; }
         .perf-dashboard .frontier-grid { grid-template-columns: 1fr; }
+        .perf-dashboard .doc-ingestion-grid { grid-template-columns: 1fr; }
         .perf-dashboard .stability-grid { grid-template-columns: 1fr; }
       }
       @media (max-width: 720px) {
@@ -2125,3 +2527,4 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   __probeDebugEnabled = Boolean(debug_enabled);
   await maybeStartCapture("startup");
 })();
+

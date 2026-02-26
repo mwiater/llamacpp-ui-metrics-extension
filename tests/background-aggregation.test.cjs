@@ -174,6 +174,12 @@ test('background aggregations: buildDashboardStats and buildDashboardRecords sum
   assert.equal(compact[0].model, 'model-a');
   assert.equal(compact[0].input_mode, 'text_only');
   assert.equal(compact[0].ttft_ms, 220);
+  assert.equal(compact[0].prompt_ms, 200);
+  assert.equal(compact[0].predicted_ms, 1000);
+  assert.equal(compact[0].file_count, null);
+  assert.equal(compact[0].file_kind_set, 'none');
+  assert.equal(compact[0].file_size_bucket, '0');
+  assert.equal(compact[0].document_detected, true);
 });
 
 test('background scenario comparisons: selects effective model and groups breakdowns', () => {
