@@ -438,6 +438,45 @@ function average(sum, count) {
 }
 
 /**
+ * Get Request File Count.
+ */
+function getRequestFileCount(req) {
+  return toFiniteNumber(req?.input_composition?.file_count)
+    ?? toFiniteNumber(req?.files_count)
+    ?? toFiniteNumber(req?.attachment?.file_count)
+    ?? null;
+}
+
+/**
+ * Get Request File Bytes Total.
+ */
+function getRequestFileBytesTotal(req) {
+  return toFiniteNumber(req?.input_composition?.file_bytes_total)
+    ?? toFiniteNumber(req?.files_total_bytes)
+    ?? toFiniteNumber(req?.payload_signals?.file_bytes_total)
+    ?? toFiniteNumber(req?.attachment?.file_bytes_total)
+    ?? null;
+}
+
+/**
+ * Check Whether Request Used Attached Documents.
+ */
+function isDocumentAttachedRequest(req) {
+  if (!req || typeof req !== "object") return false;
+  if (req.has_document === true || req.has_files === true) return true;
+  if (req?.document?.detected === true || req?.attachment?.detected === true) return true;
+
+  const fileCount = getRequestFileCount(req);
+  if (typeof fileCount === "number" && fileCount > 0) return true;
+
+  const fileBytes = getRequestFileBytesTotal(req);
+  if (typeof fileBytes === "number" && fileBytes > 0) return true;
+
+  const inputMode = String(req?.scenario_labels?.input_mode || "");
+  return inputMode.includes("file");
+}
+
+/**
  * Get Records For Session.
  */
 async function getRecordsForSession(activeSessionId) {
@@ -517,7 +556,7 @@ function buildDashboardStats(records) {
       summaryAcc.cacheNCount += 1;
     }
 
-    if (r?.req?.has_document === true) summaryAcc.docCount += 1;
+    if (isDocumentAttachedRequest(r?.req)) summaryAcc.docCount += 1;
     if (r?.req?.has_images === true) summaryAcc.imageCount += 1;
 
     if (!perModel.has(model)) {
@@ -602,7 +641,7 @@ function buildDashboardStats(records) {
       m.cacheNCount += 1;
     }
 
-    if (r?.req?.has_document === true) m.docCount += 1;
+    if (isDocumentAttachedRequest(r?.req)) m.docCount += 1;
     if (r?.req?.has_images === true) m.imageCount += 1;
 
     if (capturedAt !== null) {
@@ -658,7 +697,7 @@ function buildDashboardRecords(records) {
       model: r?.req?.model || r?.resp?.model || "unknown",
       input_mode: r?.req?.scenario_labels?.input_mode || "unknown",
       has_images: r?.req?.has_images === true,
-      has_files: r?.req?.has_files === true,
+      has_files: r?.req?.has_files === true || isDocumentAttachedRequest(r?.req),
       finish_reason: r?.resp?.finish_reason || null,
       prompt_n: toFiniteNumber(r?.resp?.timings?.prompt_n),
       predicted_n: toFiniteNumber(r?.resp?.timings?.predicted_n),
@@ -677,11 +716,11 @@ function buildDashboardRecords(records) {
       reasoning_n: toFiniteNumber(r?.resp?.derived?.reasoning_n),
       content_n: toFiniteNumber(r?.resp?.derived?.content_n),
       text_bytes_total: toFiniteNumber(r?.req?.input_composition?.text_bytes_total),
-      file_count: toFiniteNumber(r?.req?.input_composition?.file_count) ?? toFiniteNumber(r?.req?.files_count),
-      file_bytes_total: toFiniteNumber(r?.req?.input_composition?.file_bytes_total),
+      file_count: getRequestFileCount(r?.req),
+      file_bytes_total: getRequestFileBytesTotal(r?.req),
       file_kind_set: r?.req?.scenario_labels?.file_kind_set || "none",
       file_size_bucket: r?.req?.scenario_labels?.file_size_bucket || "unknown",
-      document_detected: r?.req?.document?.detected === true || r?.req?.has_document === true,
+      document_detected: isDocumentAttachedRequest(r?.req),
       output_tokens_estimate: toFiniteNumber(r?.resp?.guardrails?.output_length_estimate?.output_tokens_estimate),
       output_chars_estimate: toFiniteNumber(r?.resp?.guardrails?.output_length_estimate?.output_chars_estimate),
       prompt_hash: r?.req?.prompt_identity?.prompt_hash || null

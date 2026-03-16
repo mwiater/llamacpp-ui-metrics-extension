@@ -148,6 +148,9 @@ test('background aggregations: buildDashboardStats and buildDashboardRecords sum
     'safePct',
     'round2',
     'average',
+    'getRequestFileCount',
+    'getRequestFileBytesTotal',
+    'isDocumentAttachedRequest',
     'buildDashboardStats',
     'buildDashboardRecords'
   ]);
@@ -179,6 +182,48 @@ test('background aggregations: buildDashboardStats and buildDashboardRecords sum
   assert.equal(compact[0].file_count, null);
   assert.equal(compact[0].file_kind_set, 'none');
   assert.equal(compact[0].file_size_bucket, '0');
+  assert.equal(compact[0].document_detected, true);
+});
+
+test('background document detection: legacy file signals still count as document-attached', () => {
+  const bg = loadFunctions(path.join(repo, 'background.js'), [
+    'toFiniteNumber',
+    'safePct',
+    'round2',
+    'average',
+    'getRequestFileCount',
+    'getRequestFileBytesTotal',
+    'isDocumentAttachedRequest',
+    'buildDashboardStats',
+    'buildDashboardRecords'
+  ]);
+
+  const legacyDoc = makeRecord({
+    req: {
+      has_document: false,
+      has_files: false,
+      files_count: 2,
+      files_total_bytes: 8192,
+      input_composition: {
+        file_bytes_total: null,
+        file_count: null
+      },
+      scenario_labels: {
+        input_mode: 'unknown'
+      }
+    }
+  });
+
+  assert.equal(bg.isDocumentAttachedRequest(legacyDoc.req), true);
+
+  const stats = bg.buildDashboardStats([legacyDoc]);
+  assert.equal(stats.summary.document_attached_requests_pct, 100);
+  assert.equal(stats.models[0].doc_request_pct, 100);
+
+  const compact = bg.buildDashboardRecords([legacyDoc]);
+  assert.equal(compact[0].has_files, true);
+  assert.equal(compact[0].file_count, 2);
+  assert.equal(compact[0].file_bytes_total, 8192);
   assert.equal(compact[0].document_detected, true);
 });
 

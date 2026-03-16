@@ -573,9 +573,23 @@ function perfSpeedBarRow(label, value, unit, pct, color, valueClass = "val", bad
 }
 
 /**
+ * Check Whether Compact Dashboard Record Used Attached Documents.
+ */
+function perfIsDocumentAttachedRecord(record) {
+  if (!record || typeof record !== "object") return false;
+  if (record.document_detected === true || record.has_files === true) return true;
+  if (igSafeNum(record.file_count, 0) > 0) return true;
+  const fileBytes = toFiniteNumber(record.file_bytes_total);
+  if (typeof fileBytes === "number" && fileBytes > 0) return true;
+  const mode = String(record.input_mode || "");
+  return mode.includes("file");
+}
+
+/**
  * Perf Build Document Ingestion Rows.
  */
 function perfBuildDocumentIngestionRows(records) {
+  const DOC_MIN_SAMPLES = 3;
   const byModel = new Map();
   for (const r of records || []) {
     const model = r?.model || "unknown";
@@ -587,12 +601,7 @@ function perfBuildDocumentIngestionRows(records) {
   let colorIdx = 0;
   for (const [model, arr] of Array.from(byModel.entries()).sort((a, b) => a[0].localeCompare(b[0]))) {
     const textRows = arr.filter((r) => (r?.input_mode || "unknown") === "text_only");
-    const fileRows = arr.filter((r) => {
-      const mode = String(r?.input_mode || "");
-      const legacyFallback = (r?.document_detected === null || typeof r?.document_detected === "undefined") && r?.has_files === true;
-      return mode.includes("file") && (r?.document_detected === true || legacyFallback);
-    });
-    if (!fileRows.length) continue;
+    const fileRows = arr.filter((r) => perfIsDocumentAttachedRecord(r));
 
     const textTtftVals = textRows.map((r) => toFiniteNumber(r?.ttft_ms)).filter((x) => x !== null);
     const textMsPerTokenVals = textRows.map((r) => {
@@ -617,6 +626,7 @@ function perfBuildDocumentIngestionRows(records) {
     const ttftDeltaVals = [];
     const fileMsPerTokenVals = [];
     const fileBytesVals = [];
+    let fileTtftCount = 0;
     let baselineExactCount = 0;
     let baselineModelCount = 0;
 
@@ -634,6 +644,7 @@ function perfBuildDocumentIngestionRows(records) {
         fileMsPerTokenVals.push(predMs / predN);
       }
       if (ttft !== null) {
+        fileTtftCount += 1;
         const hash = fr?.prompt_hash || null;
         const exact = hash && textByPromptHash.has(hash) ? median(textByPromptHash.get(hash)) : null;
         const baseline = (typeof exact === "number") ? exact : textTtftBaseline;
@@ -655,12 +666,17 @@ function perfBuildDocumentIngestionRows(records) {
         return typeof v === "number" ? (v / 1_000_000) : null;
       })(),
       doc_ms_per_mb: median(docMsPerMbVals),
+      ingestion_pair_count: docMsPerMbVals.length,
       ttft_delta_ms: median(ttftDeltaVals),
       ttft_delta_count: ttftDeltaVals.length,
+      file_ttft_count: fileTtftCount,
+      text_ttft_count: textTtftVals.length,
       baseline_exact_count: baselineExactCount,
       baseline_model_count: baselineModelCount,
       ms_per_output_token_file: median(fileMsPerTokenVals),
+      file_output_speed_count: fileMsPerTokenVals.length,
       ms_per_output_token_text: textMsPerTokenBaseline,
+      text_output_speed_count: textMsPerTokenVals.length,
       output_efficiency_delta_pct: (() => {
         const f = median(fileMsPerTokenVals);
         const t = textMsPerTokenBaseline;
@@ -668,7 +684,9 @@ function perfBuildDocumentIngestionRows(records) {
         return ((f - t) / t) * 100;
       })(),
       file_kind_set: uniqueValues(fileRows.map((r) => r?.file_kind_set || "none")).join(", "),
-      file_size_bucket_set: uniqueValues(fileRows.map((r) => r?.file_size_bucket || "unknown")).join(", ")
+      file_size_bucket_set: uniqueValues(fileRows.map((r) => r?.file_size_bucket || "unknown")).join(", "),
+      text_run_count: textRows.length,
+      min_required_samples: DOC_MIN_SAMPLES
     });
   }
 
@@ -692,6 +710,12 @@ function perfDocToneClass(index, total) {
  */
 function perfRenderDocumentIngestionCard(records) {
   const rows = perfBuildDocumentIngestionRows(records);
+  const DOC_MIN_SAMPLES = 3;
+  const needRunMsg = (count, kind) => {
+    const n = Math.max(0, count | 0);
+    return `run ${formatInt(n)} more ${kind} prompt${n === 1 ? "" : "s"}`;
+  };
+  const guidanceMsg = (parts) => parts.length ? `Need more data: ${parts.join(" and ")}.` : "";
   if (!rows.length) {
     return `
       <div class="card-panel full-width">
@@ -702,32 +726,46 @@ function perfRenderDocumentIngestionCard(records) {
     `;
   }
 
-  const ingestionRows = [...rows]
-    .filter((r) => typeof r.doc_ms_per_mb === "number")
-    .sort((a, b) => a.doc_ms_per_mb - b.doc_ms_per_mb);
-  const ingestionMax = Math.max(...ingestionRows.map((r) => r.doc_ms_per_mb || 0), 1);
-  const ttftRows = [...rows]
-    .filter((r) => typeof r.ttft_delta_ms === "number")
-    .sort((a, b) => a.ttft_delta_ms - b.ttft_delta_ms);
-  const ttftAbsMax = Math.max(...ttftRows.map((r) => Math.abs(r.ttft_delta_ms || 0)), 1);
-  const outputRows = [...rows]
-    .filter((r) => typeof r.ms_per_output_token_file === "number" || typeof r.ms_per_output_token_text === "number")
-    .sort((a, b) => (a.ms_per_output_token_file ?? Infinity) - (b.ms_per_output_token_file ?? Infinity));
-  const outputMax = Math.max(...outputRows.flatMap((r) => [r.ms_per_output_token_file || 0, r.ms_per_output_token_text || 0]), 1);
+  const ingestionRows = [...rows].sort((a, b) => {
+    const av = typeof a.doc_ms_per_mb === "number" ? a.doc_ms_per_mb : Number.POSITIVE_INFINITY;
+    const bv = typeof b.doc_ms_per_mb === "number" ? b.doc_ms_per_mb : Number.POSITIVE_INFINITY;
+    return av - bv || (a.short || "").localeCompare(b.short || "");
+  });
+  const ingestionValidRows = ingestionRows.filter((r) => typeof r.doc_ms_per_mb === "number");
+  const ingestionMax = Math.max(...ingestionValidRows.map((r) => r.doc_ms_per_mb || 0), 1);
+  const ttftRows = [...rows].sort((a, b) => {
+    const av = typeof a.ttft_delta_ms === "number" ? a.ttft_delta_ms : Number.POSITIVE_INFINITY;
+    const bv = typeof b.ttft_delta_ms === "number" ? b.ttft_delta_ms : Number.POSITIVE_INFINITY;
+    return av - bv || (a.short || "").localeCompare(b.short || "");
+  });
+  const ttftValidRows = ttftRows.filter((r) => typeof r.ttft_delta_ms === "number");
+  const ttftAbsMax = Math.max(...ttftValidRows.map((r) => Math.abs(r.ttft_delta_ms || 0)), 1);
+  const outputRows = [...rows].sort((a, b) => {
+    const av = typeof a.ms_per_output_token_file === "number" ? a.ms_per_output_token_file : Number.POSITIVE_INFINITY;
+    const bv = typeof b.ms_per_output_token_file === "number" ? b.ms_per_output_token_file : Number.POSITIVE_INFINITY;
+    return av - bv || (a.short || "").localeCompare(b.short || "");
+  });
+  const outputValidRows = outputRows.filter((r) => typeof r.ms_per_output_token_file === "number" || typeof r.ms_per_output_token_text === "number");
+  const outputMax = Math.max(...outputValidRows.flatMap((r) => [r.ms_per_output_token_file || 0, r.ms_per_output_token_text || 0]), 1);
 
   const ingestionHtml = ingestionRows.length
     ? ingestionRows.map((r, i) => {
-      const cls = perfDocToneClass(i, ingestionRows.length);
-      const pct = ((r.doc_ms_per_mb || 0) / ingestionMax) * 100;
-      const medal = i < 3 ? ["🥇 ", "🥈 ", "🥉 "][i] : "";
+      const valid = typeof r.doc_ms_per_mb === "number" && r.ingestion_pair_count >= DOC_MIN_SAMPLES;
+      const cls = valid ? perfDocToneClass(i, ingestionRows.length) : "disabled";
+      const pct = valid ? ((r.doc_ms_per_mb || 0) / ingestionMax) * 100 : 0;
+      const medal = valid && i < 3 ? ["🥇 ", "🥈 ", "🥉 "][i] : "";
+      const needDocs = Math.max(0, DOC_MIN_SAMPLES - igSafeNum(r.ingestion_pair_count, 0));
+      const guidance = valid
+        ? `${formatInt(r.file_run_count)} runs - median file ${formatNumber(r.file_bytes_median_mb, 2)} MB`
+        : guidanceMsg([needRunMsg(needDocs, "document-attached")]);
       return `
-        <div class="doc-metric-row">
+        <div class="doc-metric-row ${valid ? "" : "is-disabled"}">
           <div class="doc-row-head">
             <span class="doc-name"><span class="color-dot" style="background:${r.color}"></span>${medal}${escapeHtml(r.short)}</span>
-            <span class="doc-value">${formatNumber(r.doc_ms_per_mb, 0)} ms/MB</span>
+            <span class="doc-value">${valid ? `${formatNumber(r.doc_ms_per_mb, 0)} ms/MB` : "-"}</span>
           </div>
-          <div class="doc-track"><div class="doc-fill ${cls}" style="width:${formatNumber(pct, 1)}%"></div></div>
-          <div class="doc-meta">${formatInt(r.file_run_count)} runs · median file ${formatNumber(r.file_bytes_median_mb, 2)} MB</div>
+          <div class="doc-track ${valid ? "" : "disabled"}"><div class="doc-fill ${cls}" style="width:${formatNumber(pct, 1)}%"></div></div>
+          <div class="doc-meta">${guidance}</div>
         </div>
       `;
     }).join("")
@@ -735,24 +773,31 @@ function perfRenderDocumentIngestionCard(records) {
 
   const ttftHtml = ttftRows.length
     ? ttftRows.map((r) => {
+      const valid = typeof r.ttft_delta_ms === "number" && r.ttft_delta_count >= DOC_MIN_SAMPLES;
       const delta = r.ttft_delta_ms || 0;
-      const magPct = (Math.abs(delta) / ttftAbsMax) * 50;
+      const magPct = valid ? (Math.abs(delta) / ttftAbsMax) * 50 : 0;
       const left = delta < 0 ? (50 - magPct) : 50;
-      const cls = delta < 0 ? "good" : (delta > 0 ? "warn" : "mid");
+      const cls = valid ? (delta < 0 ? "good" : (delta > 0 ? "warn" : "mid")) : "disabled";
       const baselineLabel = r.baseline_exact_count > 0
         ? (r.baseline_model_count > 0 ? `mixed baseline (${r.baseline_exact_count} exact)` : "prompt-hash baseline")
         : "model baseline";
+      const guidanceParts = [];
+      const needText = Math.max(0, DOC_MIN_SAMPLES - igSafeNum(r.text_ttft_count, 0));
+      const needFile = Math.max(0, DOC_MIN_SAMPLES - igSafeNum(r.file_ttft_count, 0));
+      if (needText > 0) guidanceParts.push(needRunMsg(needText, "text-only"));
+      if (needFile > 0) guidanceParts.push(needRunMsg(needFile, "document-attached"));
+      const guidance = valid ? `${baselineLabel} - ${formatInt(r.ttft_delta_count)} comparable runs` : guidanceMsg(guidanceParts);
       return `
-        <div class="doc-metric-row">
+        <div class="doc-metric-row ${valid ? "" : "is-disabled"}">
           <div class="doc-row-head">
             <span class="doc-name"><span class="color-dot" style="background:${r.color}"></span>${escapeHtml(r.short)}</span>
-            <span class="doc-value ${delta < 0 ? "val-green" : delta > 0 ? "val-warn" : "val"}">${delta >= 0 ? "+" : ""}${formatNumber(delta, 0)} ms</span>
+            <span class="doc-value ${valid ? (delta < 0 ? "val-green" : delta > 0 ? "val-warn" : "val") : ""}">${valid ? `${delta >= 0 ? "+" : ""}${formatNumber(delta, 0)} ms` : "-"}</span>
           </div>
-          <div class="doc-delta-track">
+          <div class="doc-delta-track ${valid ? "" : "disabled"}">
             <div class="doc-delta-zero"></div>
             <div class="doc-delta-fill ${cls}" style="left:${formatNumber(left, 1)}%;width:${formatNumber(magPct, 1)}%"></div>
           </div>
-          <div class="doc-meta">${baselineLabel} · ${formatInt(r.ttft_delta_count)} comparable runs</div>
+          <div class="doc-meta">${guidance}</div>
         </div>
       `;
     }).join("")
@@ -760,38 +805,47 @@ function perfRenderDocumentIngestionCard(records) {
 
   const outputHtml = outputRows.length
     ? outputRows.map((r) => {
+      const valid = typeof r.ms_per_output_token_file === "number" && typeof r.ms_per_output_token_text === "number" && r.file_output_speed_count >= DOC_MIN_SAMPLES && r.text_output_speed_count >= DOC_MIN_SAMPLES;
       const f = r.ms_per_output_token_file;
       const t = r.ms_per_output_token_text;
-      const filePct = typeof f === "number" ? (f / outputMax) * 100 : 0;
-      const textPct = typeof t === "number" ? (t / outputMax) * 100 : 0;
+      const filePct = valid && typeof f === "number" ? (f / outputMax) * 100 : 0;
+      const textPct = valid && typeof t === "number" ? (t / outputMax) * 100 : 0;
       const deltaPct = r.output_efficiency_delta_pct;
+      const guidanceParts = [];
+      const needText = Math.max(0, DOC_MIN_SAMPLES - igSafeNum(r.text_output_speed_count, 0));
+      const needFile = Math.max(0, DOC_MIN_SAMPLES - igSafeNum(r.file_output_speed_count, 0));
+      if (needText > 0) guidanceParts.push(needRunMsg(needText, "text-only"));
+      if (needFile > 0) guidanceParts.push(needRunMsg(needFile, "document-attached"));
+      const guidance = valid
+        ? `${deltaPct >= 0 ? "+" : ""}${formatNumber(deltaPct, 1)}% vs text baseline`
+        : guidanceMsg(guidanceParts);
       return `
-        <div class="doc-metric-row">
+        <div class="doc-metric-row ${valid ? "" : "is-disabled"}">
           <div class="doc-row-head">
             <span class="doc-name"><span class="color-dot" style="background:${r.color}"></span>${escapeHtml(r.short)}</span>
-            <span class="doc-value">${typeof f === "number" ? `${formatNumber(f, 2)} ms/tok` : "-"}</span>
+            <span class="doc-value">${valid && typeof f === "number" ? `${formatNumber(f, 2)} ms/tok` : "-"}</span>
           </div>
           <div class="doc-dual-bars">
             <div class="doc-dual-line">
               <span class="doc-dual-label">Text</span>
-              <div class="doc-track"><div class="doc-fill neutral" style="width:${formatNumber(textPct, 1)}%"></div></div>
-              <span class="doc-dual-value">${typeof t === "number" ? formatNumber(t, 2) : "-"}</span>
+              <div class="doc-track ${valid ? "" : "disabled"}"><div class="doc-fill ${valid ? "neutral" : "disabled"}" style="width:${formatNumber(textPct, 1)}%"></div></div>
+              <span class="doc-dual-value">${valid && typeof t === "number" ? formatNumber(t, 2) : "-"}</span>
             </div>
             <div class="doc-dual-line">
               <span class="doc-dual-label">File</span>
-              <div class="doc-track"><div class="doc-fill blue" style="width:${formatNumber(filePct, 1)}%"></div></div>
-              <span class="doc-dual-value">${typeof f === "number" ? formatNumber(f, 2) : "-"}</span>
+              <div class="doc-track ${valid ? "" : "disabled"}"><div class="doc-fill ${valid ? "blue" : "disabled"}" style="width:${formatNumber(filePct, 1)}%"></div></div>
+              <span class="doc-dual-value">${valid && typeof f === "number" ? formatNumber(f, 2) : "-"}</span>
             </div>
           </div>
-          <div class="doc-meta">${typeof deltaPct === "number" ? `${deltaPct >= 0 ? "+" : ""}${formatNumber(deltaPct, 1)}% vs text baseline` : "No text-only output-speed baseline"}</div>
+          <div class="doc-meta">${guidance}</div>
         </div>
       `;
     }).join("")
     : `<div class="llm-empty">No output timing data available for document runs.</div>`;
 
-  const bestIngestion = ingestionRows[0] || null;
-  const bestTtft = [...ttftRows].sort((a, b) => (a.ttft_delta_ms || 0) - (b.ttft_delta_ms || 0))[0] || null;
-  const stableOutput = [...outputRows]
+  const bestIngestion = ingestionValidRows[0] || null;
+  const bestTtft = [...ttftValidRows].sort((a, b) => (a.ttft_delta_ms || 0) - (b.ttft_delta_ms || 0))[0] || null;
+  const stableOutput = [...outputValidRows]
     .filter((r) => typeof r.output_efficiency_delta_pct === "number")
     .sort((a, b) => Math.abs(a.output_efficiency_delta_pct) - Math.abs(b.output_efficiency_delta_pct))[0] || null;
 
@@ -1232,7 +1286,7 @@ function renderDashboard(stats) {
     const distinctModels = uniqueValues(filtered.map((r) => r?.model)).length;
     const predTpsVals = filtered.map((r) => toFiniteNumber(r?.predicted_tps)).filter((x) => x !== null);
     const ttftVals = filtered.map((r) => toFiniteNumber(r?.ttft_ms)).filter((x) => x !== null);
-    const docCount = filtered.filter((r) => (r?.input_mode || "").includes("file")).length;
+    const docCount = filtered.filter((r) => perfIsDocumentAttachedRecord(r)).length;
     const imageCount = filtered.filter((r) => r?.has_images === true).length;
     return {
       total_completions: total,
@@ -2193,12 +2247,25 @@ function mountDashboardUi() {
       .perf-dashboard .doc-fill.warn { background: var(--accent-warn); }
       .perf-dashboard .doc-fill.blue { background: var(--accent-secondary); }
       .perf-dashboard .doc-fill.neutral { background: color-mix(in srgb, var(--text-secondary) 65%, transparent); }
+      .perf-dashboard .doc-fill.disabled {
+        background: color-mix(in srgb, var(--text-muted) 45%, transparent);
+        opacity: .45;
+      }
       .perf-dashboard .doc-meta {
         margin-top: 3px;
         color: var(--text-muted);
         font-size: .62rem;
         line-height: 1.2;
         font-family: var(--perf-font-body);
+      }
+      .perf-dashboard .doc-track.disabled {
+        border-style: dashed;
+        opacity: .75;
+      }
+      .perf-dashboard .doc-metric-row.is-disabled .doc-name,
+      .perf-dashboard .doc-metric-row.is-disabled .doc-value,
+      .perf-dashboard .doc-metric-row.is-disabled .doc-dual-value {
+        color: var(--text-muted);
       }
       .perf-dashboard .doc-delta-track {
         position: relative;
@@ -2227,6 +2294,11 @@ function mountDashboardUi() {
       .perf-dashboard .doc-delta-fill.good { background: var(--accent-positive); }
       .perf-dashboard .doc-delta-fill.mid { background: var(--accent-gold); }
       .perf-dashboard .doc-delta-fill.warn { background: var(--accent-warn); }
+      .perf-dashboard .doc-delta-fill.disabled {
+        background: color-mix(in srgb, var(--text-muted) 40%, transparent);
+        opacity: .5;
+      }
+      .perf-dashboard .doc-delta-track.disabled { opacity: .75; border-style: dashed; }
       .perf-dashboard .doc-dual-bars { display:grid; gap: 3px; }
       .perf-dashboard .doc-dual-line {
         display:grid;
