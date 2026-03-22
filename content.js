@@ -526,10 +526,17 @@ function perfBuildModelRows(records) {
     if (!by.has(model)) by.set(model, []);
     by.get(model).push(r);
   }
-  const rows = Array.from(by.entries()).map(([model, arr], idx) => {
+  const baseRows = Array.from(by.entries()).map(([model, arr], idx) => {
     const ttftVals = arr.map((r) => toFiniteNumber(r.ttft_ms)).filter((x) => x !== null);
     const tpsVals = arr.map((r) => toFiniteNumber(r.predicted_tps)).filter((x) => x !== null);
     const promptTpsVals = arr.map((r) => toFiniteNumber(r.prompt_tps)).filter((x) => x !== null);
+    const totalDurationVals = arr.map((r) => toFiniteNumber(r.request_to_stop_ms)).filter((x) => x !== null);
+    const requestToHeadersVals = arr.map((r) => toFiniteNumber(r.request_to_headers_ms)).filter((x) => x !== null);
+    const headersToFirstVals = arr.map((r) => toFiniteNumber(r.headers_to_first_stream_chunk_ms)).filter((x) => x !== null);
+    const firstToStopVals = arr.map((r) => toFiniteNumber(r.first_stream_chunk_to_stop_ms)).filter((x) => x !== null);
+    const reasoningMsVals = arr.map((r) => toFiniteNumber(r.reasoning_ms)).filter((x) => x !== null);
+    const reasoningNVals = arr.map((r) => toFiniteNumber(r.reasoning_n)).filter((x) => x !== null);
+    const predictedNVals = arr.map((r) => toFiniteNumber(r.predicted_n)).filter((x) => x !== null);
     const reasoningShares = arr.map((r) => {
       const rn = igSafeNum(r.reasoning_n, 0);
       const cn = igSafeNum(r.content_n, 0) || igSafeNum(r.predicted_n, 0);
@@ -537,22 +544,173 @@ function perfBuildModelRows(records) {
       return d > 0 ? (rn / d) * 100 : null;
     }).filter((x) => typeof x === "number");
     const isVision = arr.some((r) => r.has_images) || /vision|vl/i.test(model);
+    const avgReasoningOverhead = (() => {
+      const pairs = arr.map((r) => {
+        const ms = toFiniteNumber(r.reasoning_ms);
+        const n = toFiniteNumber(r.reasoning_n) ?? toFiniteNumber(r.predicted_n);
+        if (ms === null || n === null || n <= 0) return null;
+        return ms / n;
+      }).filter((x) => x !== null);
+      return median(pairs);
+    })();
+    const params = parseParamsBillions(model);
     return {
       model,
       short: shortenModelName(model.replace(/-Q\d.*$/i, ""), 18),
       count: arr.length,
+      family: deriveModelFamily(model),
+      modality: deriveModelModality(model, arr, isVision),
+      quantization: deriveQuantizationLabel(model),
       ttft: median(ttftVals),
       ttftAvg: avgOf(ttftVals),
+      ttftMin: ttftVals.length ? Math.min(...ttftVals) : null,
+      ttftMax: ttftVals.length ? Math.max(...ttftVals) : null,
+      ttftQ1: quantile(ttftVals, 0.25),
+      ttftQ3: quantile(ttftVals, 0.75),
       ttftStd: stdDev(ttftVals),
       tps: median(tpsVals),
       promptTps: median(promptTpsVals),
+      totalDuration: median(totalDurationVals),
+      requestToHeaders: median(requestToHeadersVals),
+      headersToFirst: median(headersToFirstVals),
+      firstToStop: median(firstToStopVals),
+      reasoningMs: median(reasoningMsVals),
+      reasoningN: median(reasoningNVals),
+      predictedN: median(predictedNVals),
       reasoningPct: reasoningShares.length ? avgOf(reasoningShares) : 0,
-      params: parseParamsBillions(model),
+      reasoningOverhead: avgReasoningOverhead,
+      params,
       vision: isVision,
       color: perfColorByIndex(idx)
     };
   });
+  const regression = fitExpectedTpsByParams(baseRows);
+  const ttftRange = getMetricRange(baseRows, (m) => m.ttft);
+  const totalDurationRange = getMetricRange(baseRows, (m) => m.totalDuration);
+  const tpsPerBRange = getMetricRange(baseRows, (m) => (m.params && m.tps) ? (m.tps / m.params) : null);
+  const ttftPerBRange = getMetricRange(baseRows, (m) => (m.params && m.ttft) ? (m.ttft / m.params) : null);
+  const reasoningRange = getMetricRange(baseRows, (m) => m.reasoningOverhead);
+  const stabilityRange = getMetricRange(baseRows, (m) => m.ttftStd);
+  const promptTpsRange = getMetricRange(baseRows, (m) => m.promptTps);
+  const outputTpsRange = getMetricRange(baseRows, (m) => m.tps);
+
+  const rows = baseRows.map((m) => {
+    const expectedTps = (m.params && typeof m.tps === "number") ? regression.predict(m.params) : null;
+    const tpsPerB = (m.params && typeof m.tps === "number") ? (m.tps / m.params) : null;
+    const ttftPerB = (m.params && typeof m.ttft === "number") ? (m.ttft / m.params) : null;
+    return {
+      ...m,
+      regression_method: regression.method,
+      expectedTps,
+      speedEfficiencyRatio: (typeof expectedTps === "number" && expectedTps > 0 && typeof m.tps === "number") ? (m.tps / expectedTps) : null,
+      tpsPerB,
+      ttftPerB,
+      promptThroughputScore: normalizeMetricValue(m.promptTps, promptTpsRange.min, promptTpsRange.max, false),
+      outputThroughputScore: normalizeMetricValue(m.tps, outputTpsRange.min, outputTpsRange.max, false),
+      responsivenessScore: normalizeMetricValue(m.ttft, ttftRange.min, ttftRange.max, true),
+      totalSpeedScore: normalizeMetricValue(m.totalDuration, totalDurationRange.min, totalDurationRange.max, true),
+      sizeEfficiencyScore: normalizeMetricValue(tpsPerB, tpsPerBRange.min, tpsPerBRange.max, false),
+      sizeNormalizedResponsivenessScore: normalizeMetricValue(ttftPerB, ttftPerBRange.min, ttftPerBRange.max, true),
+      reasoningEfficiencyScore: normalizeMetricValue(m.reasoningOverhead, reasoningRange.min, reasoningRange.max, true),
+      stabilityScore: normalizeMetricValue(m.ttftStd, stabilityRange.min, stabilityRange.max, true)
+    };
+  });
+
   return rows.sort((a, b) => (a.model || "").localeCompare(b.model || ""));
+}
+
+/**
+ * Derive Model Family.
+ */
+function deriveModelFamily(modelName) {
+  const s = String(modelName || "").trim();
+  if (!s) return "Unknown";
+  const m = s.match(/^([A-Za-z][A-Za-z0-9.]*)/);
+  return m ? m[1] : s.split(/[\s/_-]+/)[0] || "Unknown";
+}
+
+/**
+ * Derive Quantization Label.
+ */
+function deriveQuantizationLabel(modelName) {
+  const m = String(modelName || "").match(/\b(Q\d(?:[_A-Z0-9]+)?|IQ\d(?:[_A-Z0-9]+)?)\b/i);
+  return m ? m[1] : null;
+}
+
+/**
+ * Derive Model Modality.
+ */
+function deriveModelModality(modelName, records, isVision) {
+  if (!isVision) return "text-only";
+  const hasImages = Array.isArray(records) && records.some((r) => r?.has_images === true);
+  const looksMulti = /vision|vl|llava|multimodal/i.test(String(modelName || ""));
+  if (hasImages && looksMulti) return "multimodal";
+  return "vision-capable";
+}
+
+/**
+ * Get Metric Range.
+ */
+function getMetricRange(items, getter) {
+  const vals = (items || []).map(getter).filter((x) => typeof x === "number" && Number.isFinite(x));
+  if (!vals.length) return { min: null, max: null };
+  return { min: Math.min(...vals), max: Math.max(...vals) };
+}
+
+/**
+ * Normalize Metric Value.
+ */
+function normalizeMetricValue(value, min, max, inverse = false) {
+  if (![value, min, max].every((x) => typeof x === "number" && Number.isFinite(x))) return null;
+  if (max <= min) return 100;
+  const raw = (value - min) / (max - min);
+  const pct = inverse ? (1 - raw) : raw;
+  return Math.max(0, Math.min(100, pct * 100));
+}
+
+/**
+ * Fit Expected TPS By Params.
+ */
+function fitExpectedTpsByParams(models) {
+  const points = (models || [])
+    .map((m) => ({ x: toFiniteNumber(m?.params), y: toFiniteNumber(m?.tps) }))
+    .filter((p) => p.x !== null && p.x > 0 && p.y !== null && p.y > 0);
+
+  if (points.length < 2) {
+    const fallback = avgOf(points.map((p) => p.y)) || null;
+    return {
+      method: "mean",
+      predict(x) {
+        return (typeof x === "number" && x > 0 && typeof fallback === "number") ? fallback : null;
+      }
+    };
+  }
+
+  const makeLinearFit = (transformX, transformY, invertY, method) => {
+    const transformed = points.map((p) => ({ x: transformX(p.x), y: transformY(p.y), rawX: p.x, rawY: p.y }));
+    const meanX = avgOf(transformed.map((p) => p.x));
+    const meanY = avgOf(transformed.map((p) => p.y));
+    const numerator = transformed.reduce((sum, p) => sum + ((p.x - meanX) * (p.y - meanY)), 0);
+    const denominator = transformed.reduce((sum, p) => sum + ((p.x - meanX) ** 2), 0);
+    const slope = denominator === 0 ? 0 : (numerator / denominator);
+    const intercept = meanY - slope * meanX;
+    const errors = transformed.map((p) => {
+      const predictedRaw = invertY(intercept + slope * p.x);
+      return Math.abs(predictedRaw - p.rawY) / Math.max(1, p.rawY);
+    });
+    return {
+      method,
+      error: avgOf(errors) ?? Number.POSITIVE_INFINITY,
+      predict(x) {
+        if (typeof x !== "number" || !Number.isFinite(x) || x <= 0) return null;
+        return invertY(intercept + slope * transformX(x));
+      }
+    };
+  };
+
+  const linear = makeLinearFit((x) => x, (y) => y, (y) => y, "linear");
+  const logLinear = makeLinearFit((x) => Math.log(x), (y) => Math.log(y), (y) => Math.exp(y), "log");
+  return (logLinear.error <= linear.error) ? logLinear : linear;
 }
 
 /**
@@ -879,36 +1037,37 @@ function perfRenderDocumentIngestionCard(records) {
  * Perf Render Scatter Svg.
  */
 function perfRenderScatterSvg(textModels, dims = {}) {
-  if (!textModels.length) return `<div class="llm-empty">No text-only models available.</div>`;
+  if (!textModels.length) return `<div class="llm-empty">No models with parseable size and speed data.</div>`;
   const W = Math.max(420, Math.round(igSafeNum(dims.W, 620)));
-  const H = Math.max(220, Math.round(igSafeNum(dims.H, 220)));
-  const pad = { l: 52, r: 22, t: 26, b: 40 };
-  const ttftVals = textModels.map((m) => m.ttft).filter((x) => typeof x === "number");
+  const H = Math.max(260, Math.round(igSafeNum(dims.H, 260)));
+  const pad = { l: 56, r: 24, t: 24, b: 46 };
+  const sizeModels = textModels.filter((m) => typeof m.params === "number" && typeof m.tps === "number");
+  if (!sizeModels.length) return `<div class="llm-empty">No models with parseable parameter counts found.</div>`;
+  const xVals = sizeModels.map((m) => m.params).filter((x) => typeof x === "number");
   const tpsVals = textModels.map((m) => m.tps).filter((x) => typeof x === "number");
-  const minX = Math.max(0, (Math.min(...ttftVals) || 0) - 5);
-  const maxX = (Math.max(...ttftVals) || 100) + 10;
+  const ttftVals = sizeModels.map((m) => m.ttft).filter((x) => typeof x === "number");
+  const minX = Math.max(0, (Math.min(...xVals) || 0) * 0.9);
+  const maxX = Math.max(...xVals) * 1.08;
   const minY = 0;
   const maxY = Math.max(10, Math.ceil((Math.max(...tpsVals) || 10) / 10) * 10);
   const xp = (v) => pad.l + ((v - minX) / Math.max(1, maxX - minX)) * (W - pad.l - pad.r);
   const yp = (v) => H - pad.b - ((v - minY) / Math.max(1, maxY - minY)) * (H - pad.t - pad.b);
-  const qx = quantile(ttftVals, 0.35) ?? (minX + (maxX - minX) * 0.35);
+  const bubbleRange = getMetricRange(sizeModels, (m) => m.ttft);
+  const radiusFor = (ttft) => {
+    const score = normalizeMetricValue(ttft, bubbleRange.min, bubbleRange.max, false);
+    return 7 + ((score ?? 35) / 100) * 15;
+  };
+  const qx = quantile(xVals, 0.35) ?? (minX + (maxX - minX) * 0.35);
   const qy = quantile(tpsVals, 0.65) ?? (minY + (maxY - minY) * 0.65);
-
-  const paretoSet = new Set(
-    textModels
-      .filter((a) => typeof a.ttft === "number" && typeof a.tps === "number")
-      .filter((a) => {
-        return !textModels.some((b) => {
-          if (a === b) return false;
-          if (typeof b.ttft !== "number" || typeof b.tps !== "number") return false;
-          const noWorse = b.ttft <= a.ttft && b.tps >= a.tps;
-          const strictlyBetter = b.ttft < a.ttft || b.tps > a.tps;
-          return noWorse && strictlyBetter;
-        });
-      })
-      .map((m) => m.model)
-  );
-
+  const trendline = (() => {
+    const trendPoints = sizeModels
+      .map((m) => ({ x: m.params, y: m.expectedTps }))
+      .filter((p) => typeof p.x === "number" && typeof p.y === "number")
+      .sort((a, b) => a.x - b.x);
+    if (trendPoints.length < 2) return "";
+    const d = trendPoints.map((p, i) => `${i === 0 ? "M" : "L"} ${xp(p.x).toFixed(1)} ${yp(p.y).toFixed(1)}`).join(" ");
+    return `<path d="${d}" class="scatter-trendline"></path>`;
+  })();
   const grid = Array.from({ length: 5 }, (_, i) => {
     const y = pad.t + i * ((H - pad.t - pad.b) / 4);
     const val = maxY - i * (maxY / 4);
@@ -917,31 +1076,40 @@ function perfRenderScatterSvg(textModels, dims = {}) {
   const ticksX = Array.from({ length: 5 }, (_, i) => {
     const xVal = minX + i * ((maxX - minX) / 4);
     const x = xp(xVal);
-    return `<g><line x1="${x}" y1="${pad.t}" x2="${x}" y2="${H - pad.b}" class="scatter-grid"/><text x="${x}" y="${H - pad.b + 16}" class="scatter-tick" text-anchor="middle">${Math.round(xVal)}ms</text></g>`;
+    return `<g><line x1="${x}" y1="${pad.t}" x2="${x}" y2="${H - pad.b}" class="scatter-grid"/><text x="${x}" y="${H - pad.b + 16}" class="scatter-tick" text-anchor="middle">${formatNumber(xVal, 1)}B</text></g>`;
   }).join("");
   const zoneX2 = xp(qx);
   const zoneY = yp(qy);
   const frontierZone = `
     <rect x="${pad.l}" y="${zoneY}" width="${Math.max(0, zoneX2 - pad.l)}" height="${Math.max(0, H - pad.b - zoneY)}" class="scatter-frontier-zone"></rect>
-    <text x="${pad.l + 8}" y="${Math.max(pad.t + 14, zoneY + 16)}" class="scatter-frontier-label">Frontier candidates</text>
+    <text x="${pad.l + 8}" y="${Math.max(pad.t + 14, zoneY + 16)}" class="scatter-frontier-label">Punching-above-weight zone</text>
   `;
-  const points = textModels.map((m) => {
-    if (typeof m.ttft !== "number" || typeof m.tps !== "number") return "";
-    const x = xp(m.ttft);
+  const points = sizeModels.map((m) => {
+    if (typeof m.params !== "number" || typeof m.tps !== "number") return "";
+    const x = xp(m.params);
     const y = yp(m.tps);
-    const isPareto = paretoSet.has(m.model);
-    let anchor = m.ttft < (minX + maxX) / 2 ? "start" : "end";
+    const r = radiusFor(m.ttft);
+    let anchor = m.params < (minX + maxX) / 2 ? "start" : "end";
     if (x < pad.l + 70) anchor = "start";
     if (x > (W - pad.r - 70)) anchor = "end";
-    const dx = anchor === "start" ? 8 : -8;
-    const labelY = Math.max(pad.t + 12, y - 10);
-    const tagX = anchor === "start" ? (x + dx) : (x + dx - 2);
-    const tagAnchor = anchor;
+    const dx = anchor === "start" ? r + 4 : -(r + 4);
+    const labelY = Math.max(pad.t + 12, y - (r + 4));
+    const title = [
+      m.model,
+      `${m.family} · ${m.modality}`,
+      `Size: ${formatNumber(m.params, 1)}B`,
+      `Predicted TPS: ${formatNumber(m.tps, 1)}`,
+      `TTFT: ${formatNumber(m.ttft, 0)} ms`,
+      `TPS / 1B: ${typeof m.tpsPerB === "number" ? formatNumber(m.tpsPerB, 2) : "-"}`,
+      `Speed efficiency: ${typeof m.speedEfficiencyRatio === "number" ? formatNumber(m.speedEfficiencyRatio, 2) : "-"}`,
+      `Prompt TPS: ${typeof m.promptTps === "number" ? formatNumber(m.promptTps, 1) : "-"}`
+    ].join(" | ");
     return `
-      ${isPareto ? `<circle cx="${x}" cy="${y}" r="8.5" fill="none" class="scatter-pareto-ring"></circle>` : ""}
-      <circle cx="${x}" cy="${y}" r="4.6" fill="${m.color}" class="scatter-dot"></circle>
+      <circle cx="${x}" cy="${y}" r="${formatNumber(r, 1)}" fill="${m.color}" class="scatter-dot scatter-bubble">
+        <title>${escapeHtml(title)}</title>
+      </circle>
+      <circle cx="${x}" cy="${y}" r="3.8" fill="${m.color}" class="scatter-dot"></circle>
       <text x="${x + dx}" y="${labelY}" class="scatter-label" text-anchor="${anchor}">${escapeHtml(shortenModelName(m.short, 14))}</text>
-      ${isPareto ? `<text x="${tagX}" y="${Math.max(pad.t + 10, labelY - 12)}" class="scatter-pareto-tag" text-anchor="${tagAnchor}">Pareto</text>` : ""}
     `;
   }).join("");
   return `
@@ -949,9 +1117,10 @@ function perfRenderScatterSvg(textModels, dims = {}) {
       ${grid}
       ${ticksX}
       ${frontierZone}
+      ${trendline}
       <line x1="${pad.l}" y1="${H - pad.b}" x2="${W - pad.r}" y2="${H - pad.b}" class="scatter-axis"/>
       <line x1="${pad.l}" y1="${pad.t}" x2="${pad.l}" y2="${H - pad.b}" class="scatter-axis"/>
-      <text x="${W / 2}" y="${H - 3}" class="scatter-axis-label" text-anchor="middle">TTFT (ms) →</text>
+      <text x="${W / 2}" y="${H - 3}" class="scatter-axis-label" text-anchor="middle">Parameter Count (B) →</text>
       <text x="12" y="${H / 2}" class="scatter-axis-label" text-anchor="middle" transform="rotate(-90 12 ${H / 2})">TPS ↑</text>
       ${points}
     </svg>
@@ -963,12 +1132,12 @@ function perfRenderScatterSvg(textModels, dims = {}) {
  */
 function rerenderPerfFrontierScatter(root, records) {
   if (!root) return;
-  const chartWrap = root.querySelector('.perf-dashboard .card-panel[data-panel="efficiency-frontier"] .frontier-chart');
+  const chartWrap = root.querySelector('.perf-dashboard .card-panel[data-panel="size-speed-responsiveness"] .frontier-chart');
   if (!(chartWrap instanceof HTMLElement)) return;
-  const models = perfBuildModelRows(records).filter((m) => !m.vision && typeof m.ttft === "number");
+  const models = perfBuildModelRows(records).filter((m) => typeof m.params === "number" && typeof m.tps === "number");
   if (!models.length) return;
   const W = Math.max(420, Math.floor(chartWrap.clientWidth || 620));
-  const H = Math.max(220, Math.floor(chartWrap.clientHeight || 220));
+  const H = Math.max(260, Math.floor(chartWrap.clientHeight || 260));
   chartWrap.innerHTML = perfRenderScatterSvg(models, { W, H });
 }
 
@@ -977,7 +1146,7 @@ function rerenderPerfFrontierScatter(root, records) {
  */
 function adjustPerfFrontierChartHeight(root = __dashboardState.elements?.root) {
   if (!root) return;
-  const card = root.querySelector('.perf-dashboard .card-panel[data-panel="efficiency-frontier"]');
+  const card = root.querySelector('.perf-dashboard .card-panel[data-panel="size-speed-responsiveness"]');
   if (!(card instanceof HTMLElement)) return;
   const grid = card.querySelector(".frontier-grid");
   const chartWrap = card.querySelector(".frontier-chart");
@@ -1006,139 +1175,339 @@ function adjustPerfFrontierChartHeight(root = __dashboardState.elements?.root) {
 }
 
 /**
+ * Perf Hero Card.
+ */
+function perfHeroCard(card) {
+  return `
+    <div class="best-class-card">
+      <div class="best-class-section">${escapeHtml(card.title)}</div>
+      <div class="best-class-model">${escapeHtml(card.model || "-")}</div>
+      <div class="best-class-metric">${escapeHtml(card.metric || "-")}</div>
+      <div class="best-class-note">${escapeHtml(card.support || "")}</div>
+      <div class="best-class-subtext">${escapeHtml(card.subtext || "")}</div>
+    </div>
+  `;
+}
+
+/**
+ * Perf Render Bullet Rows.
+ */
+function perfRenderBulletRows(models) {
+  const rows = models.filter((m) => typeof m.tps === "number" && typeof m.expectedTps === "number" && typeof m.speedEfficiencyRatio === "number");
+  if (!rows.length) return `<div class="llm-empty">Need at least two models with parseable parameter counts to estimate expected speed.</div>`;
+  const maxTps = Math.max(...rows.map((m) => Math.max(m.tps || 0, m.expectedTps || 0)), 1);
+  return rows
+    .sort((a, b) => (b.speedEfficiencyRatio || 0) - (a.speedEfficiencyRatio || 0))
+    .map((m) => {
+      const actualPct = ((m.tps || 0) / maxTps) * 100;
+      const expectedPct = ((m.expectedTps || 0) / maxTps) * 100;
+      const ratioTone = (m.speedEfficiencyRatio || 0) >= 1 ? "val-green" : "val-warn";
+      const interpretation = (m.speedEfficiencyRatio || 0) >= 1.1
+        ? "Delivers more output speed than its size trend would predict."
+        : (m.speedEfficiencyRatio || 0) >= 0.95
+          ? "Performs close to the speed expected for its parameter count."
+          : "Runs slower than the size trend would suggest.";
+      return `
+        <div class="bullet-row" title="${escapeHtml(`${m.model} | Actual TPS ${formatNumber(m.tps, 1)} | Expected TPS ${formatNumber(m.expectedTps, 1)} | Speed efficiency ${formatNumber(m.speedEfficiencyRatio, 2)} | TPS/1B ${typeof m.tpsPerB === "number" ? formatNumber(m.tpsPerB, 2) : "-"}`)}">
+          <div class="bullet-head">
+            <span class="bullet-name"><span class="color-dot" style="background:${m.color}"></span>${escapeHtml(m.short)}</span>
+            <span class="bullet-meta ${ratioTone}">${formatNumber(m.speedEfficiencyRatio, 2)}x expected</span>
+          </div>
+          <div class="bullet-track">
+            <div class="bullet-band"></div>
+            <div class="bullet-bar" style="width:${formatNumber(actualPct, 1)}%;background:${m.color}"></div>
+            <div class="bullet-marker" style="left:${formatNumber(expectedPct, 1)}%"></div>
+          </div>
+          <div class="bullet-foot">
+            <span>${formatNumber(m.params, 1)}B</span>
+            <span>Actual ${formatNumber(m.tps, 1)} TPS</span>
+            <span>Expected ${formatNumber(m.expectedTps, 1)} TPS</span>
+          </div>
+          <div class="bullet-interpret">${escapeHtml(interpretation)}</div>
+        </div>
+      `;
+    }).join("");
+}
+
+/**
+ * Perf Render Dumbbell Rows.
+ */
+function perfRenderDumbbellRows(models) {
+  const rows = models.filter((m) => typeof m.responsivenessScore === "number" && typeof m.outputThroughputScore === "number");
+  if (!rows.length) return `<div class="llm-empty">Need TTFT and TPS data to compare startup and sustained speed.</div>`;
+  return rows
+    .map((m) => ({
+      ...m,
+      balanceGap: Math.abs((m.outputThroughputScore || 0) - (m.responsivenessScore || 0)),
+      balanceComposite: ((m.outputThroughputScore || 0) + (m.responsivenessScore || 0)) / 2
+    }))
+    .sort((a, b) => (b.balanceComposite - a.balanceComposite) || (a.balanceGap - b.balanceGap))
+    .map((m) => {
+      const start = m.responsivenessScore || 0;
+      const end = m.outputThroughputScore || 0;
+      const left = Math.min(start, end);
+      const width = Math.max(2, Math.abs(end - start));
+      return `
+        <div class="dumbbell-row" title="${escapeHtml(`${m.model} | TTFT ${formatNumber(m.ttft, 0)} ms | Predicted TPS ${formatNumber(m.tps, 1)} | Balance gap ${formatNumber(m.balanceGap, 1)} | Total duration ${typeof m.totalDuration === "number" ? formatNumber(m.totalDuration, 0) : "-"}`)}">
+          <div class="dumbbell-name"><span class="color-dot" style="background:${m.color}"></span>${escapeHtml(m.short)}</div>
+          <div class="dumbbell-track">
+            <div class="dumbbell-line" style="left:${formatNumber(left, 1)}%;width:${formatNumber(width, 1)}%"></div>
+            <div class="dumbbell-point start" style="left:${formatNumber(start, 1)}%;background:${m.color}"></div>
+            <div class="dumbbell-point end" style="left:${formatNumber(end, 1)}%;background:${m.color}"></div>
+          </div>
+          <div class="dumbbell-values">
+            <span>${formatNumber(start, 0)}</span>
+            <span>${formatNumber(end, 0)}</span>
+          </div>
+        </div>
+      `;
+    }).join("");
+}
+
+/**
+ * Perf Render Waterfall.
+ */
+function perfRenderWaterfall(models) {
+  const target = models.find((m) => typeof m.requestToHeaders === "number" && typeof m.headersToFirst === "number" && typeof m.firstToStop === "number") || null;
+  if (!target) return `<div class="llm-empty">Need client lifecycle timing data to render latency anatomy.</div>`;
+  const stages = [
+    { key: "requestToHeaders", label: "Request → Headers", value: target.requestToHeaders, tone: "var(--accent-secondary)" },
+    { key: "headersToFirst", label: "Headers → First chunk", value: target.headersToFirst, tone: "var(--accent-primary)" },
+    { key: "firstToStop", label: "First chunk → Stop", value: target.firstToStop, tone: "var(--accent-positive)" }
+  ];
+  const total = stages.reduce((sum, s) => sum + (s.value || 0), 0);
+  let offset = 0;
+  const stageHtml = stages.map((s) => {
+    const startPct = total > 0 ? (offset / total) * 100 : 0;
+    const widthPct = total > 0 ? ((s.value || 0) / total) * 100 : 0;
+    offset += s.value || 0;
+    return `
+      <div class="waterfall-stage" title="${escapeHtml(`${target.model} | ${s.label}: ${formatNumber(s.value, 0)} ms`)}">
+        <div class="waterfall-label">${escapeHtml(s.label)}</div>
+        <div class="waterfall-track">
+          <div class="waterfall-bar" style="left:${formatNumber(startPct, 1)}%;width:${formatNumber(widthPct, 1)}%;background:${s.tone}"></div>
+        </div>
+        <div class="waterfall-value">${formatNumber(s.value, 0)} ms</div>
+      </div>
+    `;
+  }).join("");
+  const reasonHtml = (typeof target.reasoningMs === "number" || typeof target.totalDuration === "number") ? `
+    <div class="takeaway"><strong>Selected Model:</strong> ${escapeHtml(target.short)}. Median successful-response total time is ${typeof target.totalDuration === "number" ? `${formatNumber(target.totalDuration, 0)} ms` : "-"}${typeof target.reasoningMs === "number" ? `, with ${formatNumber(target.reasoningMs, 0)} ms attributed to reasoning.` : "."}</div>
+  ` : "";
+  return `
+    <div class="waterfall-summary">Showing median successful-response stages for <b>${escapeHtml(target.short)}</b>.</div>
+    <div class="waterfall-shell">${stageHtml}</div>
+    ${reasonHtml}
+  `;
+}
+
+/**
+ * Perf Render Radar.
+ */
+function perfRenderRadar(models) {
+  const selected = models
+    .filter((m) => typeof m.promptThroughputScore === "number" || typeof m.outputThroughputScore === "number")
+    .sort((a, b) => (b.speedEfficiencyRatio || 0) - (a.speedEfficiencyRatio || 0))
+    .slice(0, 4);
+  if (selected.length < 2) {
+    return `<div class="llm-empty">Select at least two models with timing data to render the radar profile.</div>`;
+  }
+  const axes = [
+    ["Prompt Throughput", "promptThroughputScore"],
+    ["Output Throughput", "outputThroughputScore"],
+    ["Responsiveness", "responsivenessScore"],
+    ["Total Speed", "totalSpeedScore"],
+    ["Size Efficiency", "sizeEfficiencyScore"],
+    ["Speed Efficiency", "speedEfficiencyRatio"],
+    ["Reasoning Efficiency", "reasoningEfficiencyScore"],
+    ["Stability", "stabilityScore"]
+  ];
+  const speedRatioRange = getMetricRange(selected, (m) => m.speedEfficiencyRatio);
+  const valuesFor = (model) => axes.map(([_, key]) => {
+    if (key === "speedEfficiencyRatio") {
+      return normalizeMetricValue(model.speedEfficiencyRatio, speedRatioRange.min, speedRatioRange.max, false) ?? 50;
+    }
+    return model[key] ?? 50;
+  });
+  const W = 520;
+  const H = 360;
+  const cx = W / 2;
+  const cy = H / 2 + 10;
+  const radius = 118;
+  const pointFor = (angle, value) => {
+    const r = (Math.max(0, Math.min(100, value)) / 100) * radius;
+    return [cx + Math.cos(angle) * r, cy + Math.sin(angle) * r];
+  };
+  const ringHtml = [25, 50, 75, 100].map((level) => {
+    const pts = axes.map((_, i) => {
+      const angle = (-Math.PI / 2) + (i * Math.PI * 2 / axes.length);
+      return pointFor(angle, level).join(",");
+    }).join(" ");
+    return `<polygon points="${pts}" class="radar-ring"></polygon>`;
+  }).join("");
+  const axisHtml = axes.map(([label], i) => {
+    const angle = (-Math.PI / 2) + (i * Math.PI * 2 / axes.length);
+    const [x, y] = pointFor(angle, 100);
+    const [lx, ly] = pointFor(angle, 116);
+    return `
+      <line x1="${cx}" y1="${cy}" x2="${x}" y2="${y}" class="radar-axis"></line>
+      <text x="${lx}" y="${ly}" class="radar-label" text-anchor="middle">${escapeHtml(label)}</text>
+    `;
+  }).join("");
+  const cards = selected.map((m) => {
+    const vals = valuesFor(m);
+    const points = vals.map((v, i) => {
+      const angle = (-Math.PI / 2) + (i * Math.PI * 2 / axes.length);
+      return pointFor(angle, v).join(",");
+    }).join(" ");
+    const raw = `TTFT ${formatNumber(m.ttft, 0)} ms | TPS ${formatNumber(m.tps, 1)} | TPS/1B ${typeof m.tpsPerB === "number" ? formatNumber(m.tpsPerB, 2) : "-"} | Speed efficiency ${typeof m.speedEfficiencyRatio === "number" ? formatNumber(m.speedEfficiencyRatio, 2) : "-"}`;
+    const interpret = (() => {
+      const responsiveness = m.responsivenessScore ?? 0;
+      const throughput = m.outputThroughputScore ?? 0;
+      const stability = m.stabilityScore ?? 0;
+      if (responsiveness >= 65 && throughput >= 65) return "Balanced profile with both quick startup and strong sustained speed.";
+      if (responsiveness > throughput) return "Leans toward responsiveness, with a faster startup than long-run throughput.";
+      if (throughput > responsiveness) return "Leans toward sustained generation speed more than instant responsiveness.";
+      if (stability >= 65) return "More defined by consistency than standout peak speed.";
+      return "Mixed profile without a single dominant speed characteristic.";
+    })();
+    return `
+      <div class="radar-card">
+        <div class="radar-card-head">
+          <div class="radar-card-title"><span class="color-dot" style="background:${m.color}"></span>${escapeHtml(m.short)}</div>
+          <div class="radar-card-meta">${escapeHtml(m.modality)}</div>
+        </div>
+        <svg viewBox="0 0 ${W} ${H}" class="radar-svg" preserveAspectRatio="xMidYMid meet">
+          ${ringHtml}
+          ${axisHtml}
+          <polygon points="${points}" fill="${m.color}" class="radar-shape">
+            <title>${escapeHtml(`${m.model} | ${raw}`)}</title>
+          </polygon>
+        </svg>
+        <div class="radar-stats">
+          <div><span>TTFT</span><b>${typeof m.ttft === "number" ? `${formatNumber(m.ttft, 0)} ms` : "-"}</b></div>
+          <div><span>TPS</span><b>${typeof m.tps === "number" ? formatNumber(m.tps, 1) : "-"}</b></div>
+          <div><span>TPS / 1B</span><b>${typeof m.tpsPerB === "number" ? formatNumber(m.tpsPerB, 2) : "-"}</b></div>
+          <div><span>Speed Eff.</span><b>${typeof m.speedEfficiencyRatio === "number" ? `${formatNumber(m.speedEfficiencyRatio, 2)}x` : "-"}</b></div>
+        </div>
+        <div class="radar-interpret">${escapeHtml(interpret)}</div>
+      </div>
+    `;
+  }).join("");
+  return `
+    <div class="radar-wrap radar-grid">
+      ${cards}
+    </div>
+    <div class="sub-label radar-note">Each radar uses normalized scores across the current filtered successful-response dataset. Higher is better on every axis.</div>
+  `;
+}
+
+/**
+ * Perf Render Box Plot.
+ */
+function perfRenderBoxPlot(models) {
+  const eligible = models.filter((m) => typeof m.ttftQ1 === "number" && typeof m.ttftQ3 === "number" && typeof m.ttftMin === "number" && typeof m.ttftMax === "number");
+  if (!eligible.length) return "";
+  const max = Math.max(...eligible.map((m) => m.ttftMax || 0), 1);
+  return eligible
+    .sort((a, b) => (a.ttftStd || 0) - (b.ttftStd || 0))
+    .slice(0, 8)
+    .map((m) => {
+      const minPct = ((m.ttftMin || 0) / max) * 100;
+      const maxPct = ((m.ttftMax || 0) / max) * 100;
+      const q1Pct = ((m.ttftQ1 || 0) / max) * 100;
+      const q3Pct = ((m.ttftQ3 || 0) / max) * 100;
+      const medPct = ((m.ttft || 0) / max) * 100;
+      return `
+        <div class="box-row" title="${escapeHtml(`${m.model} | TTFT min ${formatNumber(m.ttftMin, 0)} ms | q1 ${formatNumber(m.ttftQ1, 0)} | median ${formatNumber(m.ttft, 0)} | q3 ${formatNumber(m.ttftQ3, 0)} | max ${formatNumber(m.ttftMax, 0)}`)}">
+          <div class="box-name"><span class="color-dot" style="background:${m.color}"></span>${escapeHtml(m.short)}</div>
+          <div class="box-track">
+            <div class="box-whisker" style="left:${formatNumber(minPct, 1)}%;width:${formatNumber(Math.max(1, maxPct - minPct), 1)}%"></div>
+            <div class="box-rect" style="left:${formatNumber(q1Pct, 1)}%;width:${formatNumber(Math.max(1, q3Pct - q1Pct), 1)}%;background:${m.color}"></div>
+            <div class="box-median" style="left:${formatNumber(medPct, 1)}%"></div>
+          </div>
+          <div class="box-value">±${formatNumber(m.ttftStd, 0)}ms</div>
+        </div>
+      `;
+    }).join("");
+}
+
+/**
  * Perf Render Dashboard Template.
  */
 function perfRenderDashboardTemplate(records, summary, theme) {
   const models = perfBuildModelRows(records);
   if (!models.length) return `<div class="llm-empty">No data available for the infographic dashboard.</div>`;
 
-  const textModels = models.filter((m) => !m.vision && typeof m.ttft === "number");
-  const visionModels = models.filter((m) => m.vision && typeof m.ttft === "number").sort((a, b) => (b.ttft || 0) - (a.ttft || 0));
+  const textModels = models.filter((m) => m.modality === "text-only" && typeof m.ttft === "number");
+  const sizedModels = models.filter((m) => typeof m.params === "number" && typeof m.tps === "number");
+  const visionModels = models.filter((m) => m.modality !== "text-only" && typeof m.ttft === "number").sort((a, b) => (a.ttft || 0) - (b.ttft || 0));
 
-  const ttftSorted = [...textModels].filter((m) => typeof m.ttft === "number").sort((a, b) => a.ttft - b.ttft).slice(0, 8);
-  const ttftMax = Math.max(...ttftSorted.map((m) => m.ttft || 0), 1) + 10;
-  const ttftBars = ttftSorted.map((m, i) => perfSpeedBarRow(m.short, m.ttft, "ms", ((m.ttft || 0) / ttftMax) * 100, m.color, "val", i < 3 ? ["🥇 ","🥈 ","🥉 "][i] : "")).join("");
-
-  const reasoningRows = models.filter((m) => (m.reasoningPct || 0) > 0).sort((a, b) => (b.reasoningPct || 0) - (a.reasoningPct || 0)).slice(0, 8);
-  const reasoningBars = reasoningRows.length
-    ? reasoningRows.map((m) => perfSpeedBarRow(m.short, m.reasoningPct, "%", m.reasoningPct, m.color, "val")).join("")
-    : `<div class="llm-empty">No reasoning-phase records detected.</div>`;
+  const ttftSorted = [...models].filter((m) => typeof m.ttft === "number").sort((a, b) => a.ttft - b.ttft).slice(0, 8);
+  const ttftMax = Math.max(...ttftSorted.map((m) => m.ttft || 0), 1);
+  const ttftBars = ttftSorted.map((m, i) => perfSpeedBarRow(m.short, m.ttft, "ms", 100 - (((m.ttft || 0) / ttftMax) * 100), m.color, "val", i < 3 ? ["🥇 ","🥈 ","🥉 "][i] : "")).join("");
 
   const tpsSorted = [...models].filter((m) => typeof m.tps === "number").sort((a, b) => (b.tps || 0) - (a.tps || 0));
   const tpsMax = Math.max(...tpsSorted.map((m) => m.tps || 0), 1);
   const tpsBars = tpsSorted.slice(0, 10).map((m, i) => perfSpeedBarRow(m.short, m.tps, "", ((m.tps || 0) / tpsMax) * 100, m.color, "val-blue", i < 3 ? ["🥇 ","🥈 ","🥉 "][i] : "")).join("");
 
-  const effSorted = [...textModels]
-    .map((m) => ({ ...m, eff: (m.params && m.tps) ? (m.tps / m.params) : null }))
-    .filter((m) => typeof m.eff === "number")
-    .sort((a, b) => b.eff - a.eff);
-  const effMax = Math.max(...effSorted.map((m) => m.eff || 0), 1);
-  const effBars = effSorted.slice(0, 8).map((m, i) => perfSpeedBarRow(`${m.short} (${formatNumber(m.params, 0)}B)`, m.eff, "", ((m.eff || 0) / effMax) * 100, m.color, "val-blue", i < 3 ? ["🥇 ","🥈 ","🥉 "][i] : "")).join("");
+  const effSorted = [...sizedModels].filter((m) => typeof m.tpsPerB === "number").sort((a, b) => (b.tpsPerB || 0) - (a.tpsPerB || 0));
+  const effMax = Math.max(...effSorted.map((m) => m.tpsPerB || 0), 1);
+  const effBars = effSorted.slice(0, 8).map((m, i) => perfSpeedBarRow(`${m.short} (${formatNumber(m.params, 1)}B)`, m.tpsPerB, "", ((m.tpsPerB || 0) / effMax) * 100, m.color, "val-blue", i < 3 ? ["🥇 ","🥈 ","🥉 "][i] : "")).join("");
 
-  const speedRank = tpsSorted.slice(0, 7).map((m, i) => `
-    <div class="consistency-row">
-      <div class="consistency-name"><span class="color-dot" style="background:${m.color}"></span>${i === 0 ? "🥇 " : i === 1 ? "🥈 " : i === 2 ? "🥉 " : ""}${escapeHtml(m.short)}</div>
-      <div class="consistency-bar-bg"><div class="consistency-bar-fill" style="width:${formatNumber(((m.tps || 0) / tpsMax) * 100, 1)}%;background:${m.color}"></div></div>
-      <div class="consistency-value" style="color:${m.color}">${formatNumber(m.tps, 1)}</div>
-    </div>
-  `).join("");
-
-  const stableSorted = [...models].filter((m) => typeof m.ttftStd === "number").sort((a, b) => (a.ttftStd || 0) - (b.ttftStd || 0));
-  const good = stableSorted.slice(0, 4);
-  const bad = stableSorted.slice(-4).reverse();
-  const stdMax = Math.max(...stableSorted.map((m) => m.ttftStd || 0), 1);
-  const stabilityRows = (list, cls, medalize = false) => list.map((m, i) => `
-    <div class="consistency-row">
-      <div class="consistency-name"><span class="color-dot" style="background:${m.color}"></span>${medalize ? (i === 0 ? "🥇 " : i === 1 ? "🥈 " : i === 2 ? "🥉 " : "") : ""}${escapeHtml(m.short)}</div>
-      <div class="consistency-bar-bg"><div class="consistency-bar-fill" style="width:${formatNumber(((m.ttftStd || 0) / stdMax) * 100, 1)}%;background:${m.color}"></div></div>
-      <div class="consistency-value ${cls}">±${formatNumber(m.ttftStd, 0)}ms</div>
-    </div>
-  `).join("");
-
-  const avgTextTtft = avgOf(textModels.map((m) => m.ttftAvg).filter((x) => typeof x === "number"));
-  const visionTop2 = visionModels.slice(0, 2);
-  const visionTaxBoxes = visionTop2.map((m) => {
-    const delta = (typeof m.ttftAvg === "number" && typeof avgTextTtft === "number") ? (m.ttftAvg - avgTextTtft) : null;
-    return `
-      <div class="vision-box">
-        <div class="vision-pct">${typeof m.ttftAvg === "number" ? `${formatNumber(m.ttftAvg, 0)}ms` : "-"}</div>
-        <div class="vision-name">${escapeHtml(shortenModelName(m.short, 18))}</div>
-        <div class="vision-delta">${typeof delta === "number" ? `${delta >= 0 ? "+" : ""}${formatNumber(delta, 0)}ms vs text avg` : ""}</div>
-      </div>
-    `;
+  const responseNormSorted = [...sizedModels].filter((m) => typeof m.sizeNormalizedResponsivenessScore === "number")
+    .sort((a, b) => (b.sizeNormalizedResponsivenessScore || 0) - (a.sizeNormalizedResponsivenessScore || 0));
+  const bulletRows = perfRenderBulletRows(sizedModels);
+  const dumbbellRows = perfRenderDumbbellRows(models);
+  const waterfall = perfRenderWaterfall(models);
+  const radar = perfRenderRadar(models);
+  const consistencyPlot = perfRenderBoxPlot(models);
+  const scatterLegend = uniqueValues(sizedModels.map((m) => m.family)).map((family) => {
+    const sample = sizedModels.find((m) => m.family === family);
+    return `<div class="legend-item"><div class="legend-dot" style="background:${sample?.color || "#999"}"></div>${escapeHtml(family)}</div>`;
   }).join("");
-  const visionCompareModels = [
-    ...ttftSorted.slice(0, 2),
-    ...visionTop2.sort((a, b) => (a.ttftAvg || 0) - (b.ttftAvg || 0))
-  ].filter((v, i, a) => a.findIndex((x) => x.model === v.model) === i);
-  const visionCompareMax = Math.max(...visionCompareModels.map((m) => m.ttftAvg || m.ttft || 0), 1);
-  const visionCompareBars = visionCompareModels.map((m) =>
-    perfSpeedBarRow(`${m.short}${m.vision ? " (vision)" : " (text)"}`, m.ttftAvg || m.ttft, "ms", (((m.ttftAvg || m.ttft || 0)) / visionCompareMax) * 100, m.color, "val")
-  ).join("");
-
-  const scatterLegend = textModels.map((m) => `<div class="legend-item"><div class="legend-dot" style="background:${m.color}"></div>${escapeHtml(m.short)}</div>`).join("");
-  const scatterSvg = perfRenderScatterSvg(textModels);
+  const scatterSvg = perfRenderScatterSvg(sizedModels);
   const docRows = perfBuildDocumentIngestionRows(records);
   const docIngestionCard = perfRenderDocumentIngestionCard(records);
 
-  const topTps = tpsSorted[0];
-  const lowTps = tpsSorted[tpsSorted.length - 1];
-  const reasoningWinner = reasoningRows[0];
+  const topTps = tpsSorted[0] || null;
   const bestTtft = ttftSorted[0] || null;
   const bestEff = effSorted[0] || null;
-  const bestStable = stableSorted[0] || null;
-  const bestDocIngestion = [...docRows]
-    .filter((r) => typeof r.doc_ms_per_mb === "number")
-    .sort((a, b) => (a.doc_ms_per_mb || 0) - (b.doc_ms_per_mb || 0))[0] || null;
-  const bestInClassCards = [
+  const bestSpeedRatio = [...sizedModels].filter((m) => typeof m.speedEfficiencyRatio === "number")
+    .sort((a, b) => (b.speedEfficiencyRatio || 0) - (a.speedEfficiencyRatio || 0))[0] || null;
+  const heroCards = [
     {
-      section: "THE RACE TO FIRST RESPONSE",
+      title: "Fastest First Response",
       model: bestTtft?.model || "-",
       metric: typeof bestTtft?.ttft === "number" ? `${formatNumber(bestTtft.ttft, 0)}ms` : "-",
-      note: "Lowest TTFT model"
+      support: bestTtft?.short || "",
+      subtext: "Lowest successful-response TTFT in the current comparison set."
     },
     {
-      section: "TOKENS PER SECOND",
+      title: "Highest Output Speed",
       model: topTps?.model || "-",
       metric: typeof topTps?.tps === "number" ? `${formatNumber(topTps.tps, 1)} TPS` : "-",
-      note: "Highest TPS model"
+      support: topTps?.short || "",
+      subtext: "Fastest sustained generation speed among successful completed runs."
     },
     {
-      section: "BIGGER ISN'T ALWAYS BETTER",
+      title: "Best TPS per 1B Parameters",
       model: bestEff?.model || "-",
-      metric: typeof bestEff?.eff === "number" ? `${formatNumber(bestEff.eff, 2)} TPS/B` : "-",
-      note: "Best TPS-per-parameter"
+      metric: typeof bestEff?.tpsPerB === "number" ? `${formatNumber(bestEff.tpsPerB, 2)} TPS / 1B` : "-",
+      support: bestEff?.short || "",
+      subtext: "Highest size-normalized output speed across successful responses."
     },
     {
-      section: "OVERALL SPEED COMPARISON",
-      model: topTps?.model || "-",
-      metric: typeof topTps?.tps === "number" ? `${formatNumber(topTps.tps, 1)} TPS` : "-",
-      note: "Highest TPS model"
-    },
-    {
-      section: "LATENCY STABILITY — MOST CONSISTENT",
-      model: bestStable?.model || "-",
-      metric: typeof bestStable?.ttftStd === "number" ? `±${formatNumber(bestStable.ttftStd, 0)}ms` : "-",
-      note: "Lowest TTFT-std model"
-    },
-    {
-      section: "DOCUMENT INGESTION",
-      model: bestDocIngestion?.model || "-",
-      metric: typeof bestDocIngestion?.doc_ms_per_mb === "number" ? `${formatNumber(bestDocIngestion.doc_ms_per_mb, 0)} ms/MB` : "-",
-      note: "Lowest ingestion cost per MB"
+      title: "Best Speed Efficiency Ratio",
+      model: bestSpeedRatio?.model || "-",
+      metric: typeof bestSpeedRatio?.speedEfficiencyRatio === "number" ? `${formatNumber(bestSpeedRatio.speedEfficiencyRatio, 2)}x` : "-",
+      support: bestSpeedRatio?.short || "",
+      subtext: "Highest output speed relative to the expected size trendline."
     }
   ];
   const bestInClassRow = `
     <div class="best-class-row full-width">
-      ${bestInClassCards.map((c) => `
-        <div class="best-class-card">
-          <div class="best-class-section">${escapeHtml(c.section)}</div>
-          <div class="best-class-kicker">🥇 Best in Class</div>
-          <div class="best-class-model">${escapeHtml(c.model)}</div>
-          <div class="best-class-metric">${escapeHtml(c.metric)}</div>
-          <div class="best-class-note">${escapeHtml(c.note)}</div>
-        </div>
-      `).join("")}
+      ${heroCards.map(perfHeroCard).join("")}
     </div>
   `;
   const headerSummaryMeta = `
@@ -1160,8 +1529,8 @@ function perfRenderDashboardTemplate(records, summary, theme) {
           <div class="header-section">
             <div class="header-mascot">🦙</div>
             <div class="header-text">
-              <h1>COMPARING LLM<br>PERFORMANCE</h1>
-              <p>Live extension metrics dashboard. Filters above apply to all panels.</p>
+              <h1>LLM PERFORMANCE<br>DASHBOARD</h1>
+              <p>All metrics shown here are based on successful completed responses. Filters above apply to every section.</p>
             </div>
             <div class="header-meta">
               ${headerSummaryMeta}
@@ -1170,87 +1539,81 @@ function perfRenderDashboardTemplate(records, summary, theme) {
           <div class="section-divider"></div>
           <div class="main-grid">
             ${bestInClassRow}
-            <div class="card-panel" data-panel="ttft">
+            <div class="card-panel tone-orange" data-panel="ttft">
               <h3 class="orange-header">THE RACE TO FIRST RESPONSE</h3>
-              <div class="sub-label">Shows time-to-first-token (TTFT) in milliseconds for text models, so compare bar lengths to identify the fastest interactive responders and spot latency outliers.</div>
+              <div class="sub-label">The first token is the first moment a model feels alive. Lower times here usually produce the strongest perception of responsiveness.</div>
               <div>${ttftBars}</div>
-              <div class="takeaway"><strong>TAKEAWAY:</strong> Fastest text models cluster near ${ttftSorted[0]?.ttft ? `${formatNumber(ttftSorted[0].ttft, 0)}ms` : "-"} TTFT.</div>
+              <div class="takeaway"><strong>TAKEAWAY:</strong> The fastest successful responses arrive in roughly ${ttftSorted[0]?.ttft ? `${formatNumber(ttftSorted[0].ttft, 0)} ms` : "-"}.</div>
             </div>
 
-            <div class="card-panel" data-panel="vision-tax">
-              <h3 class="blue-header">THE VISION TAX</h3>
-              <div class="sub-label">Compares startup latency for image-enabled requests against text-only behavior, so look for how much vision inputs increase TTFT and whether that penalty remains consistently high.</div>
-              <div class="two-col-grid" style="margin-bottom:10px;">${visionTaxBoxes || `<div class="llm-empty">No vision/image runs found.</div>`}</div>
-              <div class="sub-label">This mini comparison gives representative text and vision TTFT values, so read it as a direct illustration of the practical latency cost of multimodal prompts.</div>
-              <div>${visionCompareBars || `<div class="llm-empty">Not enough mixed text/vision data.</div>`}</div>
-              <div class="takeaway"><strong>${typeof avgTextTtft === "number" ? "VISION COST:" : "NOTE:"}</strong> ${typeof avgTextTtft === "number" ? `Text-only average TTFT is ${formatNumber(avgTextTtft, 0)}ms.` : "Capture image prompts to populate this panel."}</div>
-            </div>
-
-            ${docIngestionCard}
-
-            <div class="card-panel" data-panel="reasoning-share">
-              <h3 class="orange-header">HOW MUCH DOES IT THINK?</h3>
-              <div class="sub-label">Shows the estimated share of generated tokens consumed by internal reasoning phases, so higher bars indicate models spending more output budget thinking before visible answers.</div>
-              <div>${reasoningBars}</div>
-              <div class="takeaway"><strong>TAKEAWAY:</strong> ${reasoningWinner ? `${escapeHtml(reasoningWinner.short)} leads reasoning share at ${formatNumber(reasoningWinner.reasoningPct, 1)}%.` : "No reasoning models detected in current filter."}</div>
-            </div>
-
-            <div class="card-panel" data-panel="tps">
+            <div class="card-panel tone-blue" data-panel="tps">
               <h3 class="blue-header">TOKENS PER SECOND</h3>
-              <div class="sub-label">Ranks generation throughput in tokens per second (TPS), so compare the leaders for raw speed and note how sharply performance drops across the remaining models.</div>
+              <div class="sub-label">Once generation begins, sustained output speed shapes how fast the answer continues to arrive.</div>
               <div>${tpsBars}</div>
               <div class="takeaway"><strong>WINNER:</strong> ${topTps ? `${escapeHtml(topTps.short)} leads at ${formatNumber(topTps.tps, 1)} TPS.` : "No TPS data."}</div>
             </div>
 
-            <div class="card-panel" data-panel="efficiency-frontier">
-              <h3 class="dark-header">SPEED vs RESPONSIVENESS — The Efficiency Frontier</h3>
-              <div class="sub-label">Plots throughput (TPS) against responsiveness (TTFT) for text-only models, so look toward the top-left and the Pareto-annotated frontier for the best tradeoff candidates.</div>
+            <div class="card-panel full-width tone-dark" data-panel="size-speed-responsiveness">
+              <h3 class="dark-header">SIZE, SPEED, AND RESPONSIVENESS</h3>
+              <div class="sub-label">A three-dimensional view of practical model performance. This chart compares model size, output speed, and response latency to show which models punch above their weight.</div>
               <div class="frontier-grid">
                 <div class="chart-container frontier-chart">${scatterSvg}</div>
                 <div>
-                  <div class="legend-title">MODEL LEGEND</div>
+                  <div class="legend-title">MODEL FAMILY LEGEND</div>
                   <div>${scatterLegend}</div>
+                  <div class="takeaway"><strong>NOTE:</strong> Larger bubbles indicate worse TTFT. The trendline estimates expected TPS from model size using the current filtered comparison set.</div>
                 </div>
               </div>
             </div>
 
-            <div class="card-panel" data-panel="size-efficiency">
-              <h3 class="blue-header">BIGGER ISN'T ALWAYS BETTER</h3>
-              <div class="sub-label">Normalizes throughput by parameter count (TPS per B params) to show size efficiency, so higher bars reveal models delivering more speed per unit of model size.</div>
+            <div class="card-panel full-width tone-blue" data-panel="punching-above-weight">
+              <h3 class="blue-header">PUNCHING ABOVE ITS WEIGHT</h3>
+              <div class="sub-label">This view compares actual output speed to the speed predicted by model size. It highlights which models are faster or slower than their parameter count would suggest.</div>
+              <div class="sub-label">Expected speed is estimated from the current comparison set using a parameter-size trendline.</div>
+              <div class="bullet-list">${bulletRows}</div>
+            </div>
+
+            <div class="card-panel tone-orange" data-panel="quick-off-the-line">
+              <h3 class="orange-header">QUICK OFF THE LINE OR BUILT FOR THE LONG RUN?</h3>
+              <div class="sub-label">This chart compares response startup speed and sustained generation speed to show which models start quickly, which models sustain throughput, and which balance both.</div>
+              <div class="dumbbell-scale"><span>Startup score</span><span>Balanced</span><span>Throughput score</span></div>
+              <div class="dumbbell-list">${dumbbellRows}</div>
+            </div>
+
+            <div class="card-panel tone-dark" data-panel="latency-anatomy">
+              <h3 class="dark-header">LATENCY ANATOMY</h3>
+              <div class="sub-label">A breakdown of where successful-response time is spent, from request start to first token and through the completion of streamed output.</div>
+              <div class="sub-label">This section uses the first currently selected model with complete lifecycle timing coverage.</div>
+              ${waterfall}
+            </div>
+
+            <div class="card-panel tone-blue" data-panel="size-efficiency">
+              <h3 class="blue-header">BEST TPS PER 1B PARAMETERS</h3>
+              <div class="sub-label">This chart normalizes output speed by parameter count. Higher values indicate more generation speed per billion parameters, not a universal quality winner.</div>
               <div>${effBars || `<div class="llm-empty">No parseable parameter sizes found.</div>`}</div>
-              <div class="takeaway"><strong>TAKEAWAY:</strong> Small and mid-size models often dominate per-parameter efficiency.</div>
+              <div class="takeaway"><strong>TAKEAWAY:</strong> ${bestEff ? `${escapeHtml(bestEff.short)} leads size-normalized generation efficiency at ${formatNumber(bestEff.tpsPerB, 2)} TPS / 1B.` : "No parseable parameter sizes found."}</div>
             </div>
 
-            <div class="card-panel" data-panel="overall-speed">
-              <h3 class="orange-header">OVERALL SPEED COMPARISON</h3>
-              <div class="sub-label">Provides a compact all-model TPS ranking, so use it to confirm speed winners quickly and compare the spread between the fastest and slowest performers.</div>
-              <div class="two-col-grid" style="margin-bottom:9px;">
-                <div class="stat-highlight">
-                  <div class="big-num">${topTps ? formatNumber(topTps.tps, 1) : "-"}</div>
-                  <div class="stat-lbl">Peak TPS<br>${topTps ? escapeHtml(shortenModelName(topTps.short, 16)) : "-"}</div>
-                </div>
-                <div class="stat-highlight">
-                  <div class="big-num">${lowTps ? formatNumber(lowTps.tps, 1) : "-"}</div>
-                  <div class="stat-lbl">Lowest TPS<br>${lowTps ? escapeHtml(shortenModelName(lowTps.short, 16)) : "-"}</div>
-                </div>
-              </div>
-              <div>${speedRank}</div>
+            <div class="card-panel full-width tone-orange" data-panel="model-personality">
+              <h3 class="orange-header">MODEL PERSONALITY PROFILE</h3>
+              <div class="sub-label">A profile view of each model across speed, responsiveness, efficiency, and stability. Use this to compare whether a model is balanced or specialized.</div>
+              ${radar}
             </div>
 
-            <div class="card-panel full-width" data-panel="latency-stability">
-              <h3 class="dark-header">LATENCY STABILITY — Consistency Under Load</h3>
-              <div class="sub-label">Shows TTFT variability as standard deviation in milliseconds, so lower values indicate more predictable response starts while higher values signal unstable latency behavior.</div>
-              <div class="stability-grid">
-                <div>
-                  <div class="stab-title good">Most Consistent ✓</div>
-                  <div>${stabilityRows(good, "val-green", true)}</div>
-                </div>
-                <div>
-                  <div class="stab-title bad">Most Variable ⚠</div>
-                  <div>${stabilityRows(bad, "val-warn", false)}</div>
-                </div>
-              </div>
-              <div class="takeaway"><strong>CONSISTENCY:</strong> Use this panel to separate fast models from predictable models.</div>
+            ${docIngestionCard}
+
+            <div class="card-panel tone-blue" data-panel="vision-tax">
+              <h3 class="blue-header">VISION PERFORMANCE</h3>
+              <div class="sub-label">Vision-capable models should be judged on their own terms. Image handling adds latency and should be compared separately from text-only runs.</div>
+              <div>${visionModels.length ? visionModels.slice(0, 6).map((m, i) => perfSpeedBarRow(`${m.short} (${m.modality})`, m.ttft, "ms", 100 - (((m.ttft || 0) / Math.max(...visionModels.map((x) => x.ttft || 0), 1)) * 100), m.color, "val", i < 3 ? ["🥇 ","🥈 ","🥉 "][i] : "")).join("") : `<div class="llm-empty">Capture image prompts to populate this panel.</div>`}</div>
+              <div class="takeaway"><strong>NOTE:</strong> ${visionModels[0] ? `${escapeHtml(visionModels[0].short)} currently has the fastest successful-response vision TTFT at ${formatNumber(visionModels[0].ttft, 0)} ms.` : "Vision runs have not been captured in this filtered view."}</div>
+            </div>
+
+            <div class="card-panel full-width tone-dark" data-panel="latency-stability">
+              <h3 class="dark-header">CONSISTENCY UNDER LOAD</h3>
+              <div class="sub-label">Average speed is only part of the story. This view shows how predictably each model performs across successful runs.</div>
+              <div class="sub-label">Box ranges show TTFT spread from lower quartile to upper quartile; smaller boxes and whiskers indicate tighter behavior.</div>
+              <div class="box-list">${consistencyPlot || `<div class="llm-empty">Need repeated TTFT samples to render the distribution view.</div>`}</div>
             </div>
           </div>
           <div class="footer-section">
@@ -2009,17 +2372,22 @@ function mountDashboardUi() {
       }
       .perf-dashboard .full-width { flex-basis: 100% !important; width: 100%; }
       .perf-dashboard .main-grid > .best-class-row { flex-basis: 100%; width: 100%; }
-      .perf-dashboard .main-grid > .card-panel[data-panel="efficiency-frontier"] { flex-basis: 100%; width: 100%; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="size-speed-responsiveness"] { flex-basis: 100%; width: 100%; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="punching-above-weight"] { flex-basis: 100%; width: 100%; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="latency-stability"] { flex-basis: 100%; width: 100%; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="model-personality"] { flex-basis: 100%; width: 100%; }
       .perf-dashboard .main-grid > .best-class-row { order: 10; }
       .perf-dashboard .main-grid > .card-panel[data-panel="ttft"] { order: 20; }
       .perf-dashboard .main-grid > .card-panel[data-panel="tps"] { order: 30; }
-      .perf-dashboard .main-grid > .card-panel[data-panel="document-ingestion-efficiency"] { order: 40; }
-      .perf-dashboard .main-grid > .card-panel[data-panel="vision-tax"] { order: 50; }
-      .perf-dashboard .main-grid > .card-panel[data-panel="overall-speed"] { order: 60; }
-      .perf-dashboard .main-grid > .card-panel[data-panel="efficiency-frontier"] { order: 70; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="size-speed-responsiveness"] { order: 40; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="punching-above-weight"] { order: 50; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="quick-off-the-line"] { order: 60; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="latency-anatomy"] { order: 70; }
       .perf-dashboard .main-grid > .card-panel[data-panel="size-efficiency"] { order: 80; }
-      .perf-dashboard .main-grid > .card-panel[data-panel="reasoning-share"] { order: 90; }
-      .perf-dashboard .main-grid > .card-panel[data-panel="latency-stability"] { order: 100; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="model-personality"] { order: 90; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="document-ingestion-efficiency"] { order: 100; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="vision-tax"] { order: 110; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="latency-stability"] { order: 120; }
       .perf-dashboard .best-class-row {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -2062,7 +2430,14 @@ function mountDashboardUi() {
         font-size: .9rem;
         color: var(--text-secondary);
         line-height: 1.25;
-        min-height: 1.6em;
+        min-height: 1.1em;
+        font-family: var(--perf-font-body);
+      }
+      .perf-dashboard .best-class-subtext {
+        margin-top: 5px;
+        font-size: .72rem;
+        color: var(--text-muted);
+        line-height: 1.35;
         font-family: var(--perf-font-body);
       }
       .perf-dashboard .best-class-section {
@@ -2081,6 +2456,19 @@ function mountDashboardUi() {
         border-radius: 8px;
         padding: 12px;
         color: var(--text-primary);
+        box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02);
+      }
+      .perf-dashboard .card-panel.tone-orange {
+        box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent-primary) 14%, transparent);
+        background: linear-gradient(180deg, color-mix(in srgb, var(--accent-primary) 6%, var(--bg-card)), var(--bg-card) 22%);
+      }
+      .perf-dashboard .card-panel.tone-blue {
+        box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent-secondary) 16%, transparent);
+        background: linear-gradient(180deg, color-mix(in srgb, var(--accent-secondary) 7%, var(--bg-card)), var(--bg-card) 22%);
+      }
+      .perf-dashboard .card-panel.tone-dark {
+        box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--text-primary) 8%, transparent);
+        background: linear-gradient(180deg, color-mix(in srgb, var(--header-bg) 22%, var(--bg-card)), var(--bg-card) 24%);
       }
       .perf-dashboard .card-panel h3 {
         font-size: .82rem;
@@ -2092,9 +2480,9 @@ function mountDashboardUi() {
         border-radius: 4px;
         font-family: var(--perf-font-head);
       }
-      .perf-dashboard .orange-header { background: var(--h3-bg-orange); color: var(--accent-primary); border-left: 3px solid var(--accent-primary); }
-      .perf-dashboard .blue-header { background: var(--h3-bg-blue); color: var(--accent-secondary); border-left: 3px solid var(--accent-secondary); }
-      .perf-dashboard .dark-header { background: var(--h3-bg-dark); color: var(--text-primary); border: 1px solid var(--border-color); border-left: 3px solid var(--accent-primary); }
+      .perf-dashboard .orange-header { background: color-mix(in srgb, var(--h3-bg-orange) 72%, transparent); color: var(--accent-primary); border: 1px solid color-mix(in srgb, var(--accent-primary) 28%, transparent); border-left: 4px solid var(--accent-primary); }
+      .perf-dashboard .blue-header { background: color-mix(in srgb, var(--h3-bg-blue) 78%, transparent); color: var(--accent-secondary); border: 1px solid color-mix(in srgb, var(--accent-secondary) 28%, transparent); border-left: 4px solid var(--accent-secondary); }
+      .perf-dashboard .dark-header { background: color-mix(in srgb, var(--h3-bg-dark) 92%, transparent); color: var(--text-primary); border: 1px solid color-mix(in srgb, var(--text-primary) 12%, var(--border-color)); border-left: 4px solid var(--accent-primary); }
       .perf-dashboard .sub-label { font-size: .74rem; color: var(--text-muted); margin-bottom: 8px; font-family: var(--perf-font-body); }
       .perf-dashboard .speed-bar-container { margin: 4px 0; }
       .perf-dashboard .speed-bar-label { font-size: .78rem; color: var(--text-secondary); display: flex; justify-content: space-between; gap: 8px; margin-bottom: 2px; font-family: var(--perf-font-body); }
@@ -2166,23 +2554,207 @@ function mountDashboardUi() {
       .perf-dashboard .scatter-tick { fill: var(--canvas-text); font-size: 11px; font-family: var(--perf-font-mono); font-weight: 500; }
       .perf-dashboard .scatter-axis-label { fill: var(--canvas-text); font-size: 12px; font-family: var(--perf-font-head); font-weight: 600; }
       .perf-dashboard .scatter-dot { stroke: var(--dot-stroke); stroke-width: .8; }
-      .perf-dashboard .scatter-pareto-ring {
-        stroke: color-mix(in srgb, var(--accent-primary) 78%, #fff 8%);
+      .perf-dashboard .scatter-bubble { opacity: .22; }
+      .perf-dashboard .scatter-trendline {
+        fill: none;
+        stroke: color-mix(in srgb, var(--accent-primary) 76%, var(--text-primary));
         stroke-width: 1.6;
-        stroke-dasharray: 2 2;
-        opacity: .9;
-      }
-      .perf-dashboard .scatter-pareto-tag {
-        fill: color-mix(in srgb, var(--accent-primary) 80%, var(--text-primary));
-        font-size: 9px;
-        font-family: var(--perf-font-head);
-        font-weight: 700;
-        letter-spacing: .02em;
+        stroke-dasharray: 5 4;
       }
       .perf-dashboard .scatter-label { fill: var(--pt-label); font-size: 11px; font-weight: 700; font-family: var(--perf-font-body); }
       .perf-dashboard .legend-title { font-size:.82rem; font-weight:800; color:var(--accent-primary); margin-bottom:6px; letter-spacing:.6px; font-family: var(--perf-font-head); }
       .perf-dashboard .legend-item { display:flex; align-items:center; gap:6px; font-size:.74rem; color:var(--text-secondary); margin:2px 0; line-height:1.3; font-family: var(--perf-font-body); }
       .perf-dashboard .legend-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; opacity:.85; }
+      .perf-dashboard .radar-wrap { display:grid; gap: 14px; }
+      .perf-dashboard .radar-grid { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); align-items: stretch; }
+      .perf-dashboard .radar-card {
+        background: var(--bg-inset);
+        border: 1px solid var(--border-color);
+        border-radius: 10px;
+        padding: 10px;
+      }
+      .perf-dashboard .radar-card-head {
+        display:flex;
+        justify-content:space-between;
+        gap: 10px;
+        align-items:center;
+        margin-bottom: 8px;
+      }
+      .perf-dashboard .radar-card-title {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: var(--text-primary);
+        font-size: .8rem;
+        font-weight: 700;
+      }
+      .perf-dashboard .radar-card-meta {
+        color: var(--text-muted);
+        font-size: .66rem;
+        text-transform: uppercase;
+        letter-spacing: .06em;
+        font-family: var(--perf-font-head);
+      }
+      .perf-dashboard .radar-svg { width: 100%; height: auto; display: block; }
+      .perf-dashboard .radar-ring { fill: rgba(255,255,255,0.02); stroke: var(--canvas-grid); stroke-width: 1; }
+      .perf-dashboard .radar-axis { stroke: var(--canvas-grid); stroke-width: 1; }
+      .perf-dashboard .radar-label { fill: var(--text-secondary); font-size: 10px; font-family: var(--perf-font-head); }
+      .perf-dashboard .radar-shape { fill-opacity: .18; stroke: rgba(255,255,255,.8); stroke-width: 1.2; }
+      .perf-dashboard .radar-note { margin-top: 8px; }
+      .perf-dashboard .radar-stats {
+        display:grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px 10px;
+        margin-top: 8px;
+      }
+      .perf-dashboard .radar-stats span {
+        display:block;
+        color: var(--text-muted);
+        font-size: .6rem;
+        text-transform: uppercase;
+        letter-spacing: .06em;
+        font-family: var(--perf-font-head);
+      }
+      .perf-dashboard .radar-stats b {
+        display:block;
+        color: var(--text-primary);
+        font-size: .72rem;
+        font-family: var(--perf-font-mono);
+      }
+      .perf-dashboard .bullet-interpret,
+      .perf-dashboard .radar-interpret {
+        margin-top: 6px;
+        color: var(--text-muted);
+        font-size: .69rem;
+        line-height: 1.35;
+      }
+      .perf-dashboard .bullet-list, .perf-dashboard .dumbbell-list, .perf-dashboard .box-list { display: grid; gap: 10px; }
+      .perf-dashboard .bullet-row, .perf-dashboard .dumbbell-row, .perf-dashboard .box-row {
+        background: var(--bg-inset);
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        padding: 9px 10px;
+      }
+      .perf-dashboard .bullet-head, .perf-dashboard .bullet-foot { display:flex; justify-content:space-between; gap:8px; align-items:center; }
+      .perf-dashboard .bullet-name, .perf-dashboard .box-name, .perf-dashboard .dumbbell-name {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: var(--text-secondary);
+        font-size: .74rem;
+      }
+      .perf-dashboard .bullet-meta, .perf-dashboard .bullet-foot, .perf-dashboard .box-value, .perf-dashboard .waterfall-value {
+        font-family: var(--perf-font-mono);
+        font-size: .68rem;
+      }
+      .perf-dashboard .bullet-track, .perf-dashboard .box-track, .perf-dashboard .waterfall-track {
+        position: relative;
+        height: 16px;
+        border-radius: 999px;
+        background: var(--bg-bar-track);
+        border: 1px solid var(--border-color);
+        overflow: hidden;
+        margin: 7px 0 5px;
+      }
+      .perf-dashboard .bullet-band {
+        position:absolute;
+        inset: 0;
+        background: linear-gradient(90deg, rgba(255,255,255,0.02), rgba(255,255,255,0.08), rgba(255,255,255,0.02));
+      }
+      .perf-dashboard .bullet-bar {
+        position:absolute;
+        left:0;
+        top:1px;
+        bottom:1px;
+        border-radius: 999px;
+        opacity: .9;
+      }
+      .perf-dashboard .bullet-marker, .perf-dashboard .box-median {
+        position:absolute;
+        top:-1px;
+        bottom:-1px;
+        width: 2px;
+        background: var(--accent-primary);
+      }
+      .perf-dashboard .bullet-foot { color: var(--text-muted); }
+      .perf-dashboard .dumbbell-scale, .perf-dashboard .waterfall-summary {
+        display:flex;
+        justify-content:space-between;
+        gap: 8px;
+        color: var(--text-muted);
+        font-size: .68rem;
+        margin-bottom: 6px;
+      }
+      .perf-dashboard .dumbbell-row {
+        display:grid;
+        grid-template-columns: 150px 1fr 72px;
+        gap: 10px;
+        align-items: center;
+      }
+      .perf-dashboard .dumbbell-track {
+        position: relative;
+        height: 22px;
+      }
+      .perf-dashboard .dumbbell-line {
+        position:absolute;
+        top: 10px;
+        height: 2px;
+        background: color-mix(in srgb, var(--accent-secondary) 40%, var(--accent-primary));
+      }
+      .perf-dashboard .dumbbell-point {
+        position:absolute;
+        top: 4px;
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        transform: translateX(-50%);
+        border: 2px solid rgba(255,255,255,.75);
+      }
+      .perf-dashboard .dumbbell-point.end {
+        width: 12px;
+        height: 12px;
+        top: 5px;
+        border-color: rgba(0,0,0,.18);
+      }
+      .perf-dashboard .dumbbell-values {
+        display:flex;
+        justify-content:space-between;
+        gap: 6px;
+        font-family: var(--perf-font-mono);
+        font-size: .68rem;
+        color: var(--text-secondary);
+      }
+      .perf-dashboard .waterfall-shell { display:grid; gap: 8px; }
+      .perf-dashboard .waterfall-stage {
+        display:grid;
+        grid-template-columns: 160px 1fr 76px;
+        gap: 10px;
+        align-items:center;
+      }
+      .perf-dashboard .waterfall-label { font-size: .74rem; color: var(--text-secondary); }
+      .perf-dashboard .waterfall-bar {
+        position:absolute;
+        top:1px;
+        bottom:1px;
+        border-radius: 999px;
+        opacity: .92;
+      }
+      .perf-dashboard .box-track { height: 18px; }
+      .perf-dashboard .box-whisker {
+        position:absolute;
+        top: 8px;
+        height: 2px;
+        background: var(--text-muted);
+      }
+      .perf-dashboard .box-rect {
+        position:absolute;
+        top: 3px;
+        bottom: 3px;
+        border-radius: 4px;
+        opacity: .8;
+      }
       .perf-dashboard .doc-ingestion-grid { display:grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
       .perf-dashboard .doc-subpanel {
         background: var(--bg-inset);
@@ -2342,8 +2914,12 @@ function mountDashboardUi() {
         .perf-dashboard .main-grid > * { flex-basis: 100%; }
         .perf-dashboard .best-class-row { grid-template-columns: 1fr; }
         .perf-dashboard .frontier-grid { grid-template-columns: 1fr; }
+        .perf-dashboard .radar-grid { grid-template-columns: 1fr; }
         .perf-dashboard .doc-ingestion-grid { grid-template-columns: 1fr; }
         .perf-dashboard .stability-grid { grid-template-columns: 1fr; }
+        .perf-dashboard .dumbbell-row,
+        .perf-dashboard .waterfall-stage,
+        .perf-dashboard .box-row { grid-template-columns: 1fr; }
       }
       @media (max-width: 720px) {
         .ig-card-row { grid-template-columns: 1fr; }
