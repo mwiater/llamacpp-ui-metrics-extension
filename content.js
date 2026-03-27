@@ -539,7 +539,7 @@ function perfBuildModelRows(records) {
     const isVision = arr.some((r) => r.has_images) || /vision|vl/i.test(model);
     return {
       model,
-      short: shortenModelName(model.replace(/-Q\d.*$/i, ""), 18),
+      short: model,
       count: arr.length,
       ttft: median(ttftVals),
       ttftAvg: avgOf(ttftVals),
@@ -658,7 +658,7 @@ function perfBuildDocumentIngestionRows(records) {
 
     rows.push({
       model,
-      short: shortenModelName(model.replace(/-Q\d.*$/i, ""), 18),
+      short: model,
       color: perfColorByIndex(colorIdx++),
       file_run_count: fileRows.length,
       file_bytes_median_mb: (() => {
@@ -940,7 +940,7 @@ function perfRenderScatterSvg(textModels, dims = {}) {
     return `
       ${isPareto ? `<circle cx="${x}" cy="${y}" r="8.5" fill="none" class="scatter-pareto-ring"></circle>` : ""}
       <circle cx="${x}" cy="${y}" r="4.6" fill="${m.color}" class="scatter-dot"></circle>
-      <text x="${x + dx}" y="${labelY}" class="scatter-label" text-anchor="${anchor}">${escapeHtml(shortenModelName(m.short, 14))}</text>
+      <text x="${x + dx}" y="${labelY}" class="scatter-label" text-anchor="${anchor}">${escapeHtml(m.short)}</text>
       ${isPareto ? `<text x="${tagX}" y="${Math.max(pad.t + 10, labelY - 12)}" class="scatter-pareto-tag" text-anchor="${tagAnchor}">Pareto</text>` : ""}
     `;
   }).join("");
@@ -1062,7 +1062,7 @@ function perfRenderDashboardTemplate(records, summary, theme) {
     return `
       <div class="vision-box">
         <div class="vision-pct">${typeof m.ttftAvg === "number" ? `${formatNumber(m.ttftAvg, 0)}ms` : "-"}</div>
-        <div class="vision-name">${escapeHtml(shortenModelName(m.short, 18))}</div>
+        <div class="vision-name">${escapeHtml(m.short)}</div>
         <div class="vision-delta">${typeof delta === "number" ? `${delta >= 0 ? "+" : ""}${formatNumber(delta, 0)}ms vs text avg` : ""}</div>
       </div>
     `;
@@ -1227,11 +1227,11 @@ function perfRenderDashboardTemplate(records, summary, theme) {
               <div class="two-col-grid" style="margin-bottom:9px;">
                 <div class="stat-highlight">
                   <div class="big-num">${topTps ? formatNumber(topTps.tps, 1) : "-"}</div>
-                  <div class="stat-lbl">Peak TPS<br>${topTps ? escapeHtml(shortenModelName(topTps.short, 16)) : "-"}</div>
+                  <div class="stat-lbl">Peak TPS<br>${topTps ? escapeHtml(topTps.short) : "-"}</div>
                 </div>
                 <div class="stat-highlight">
                   <div class="big-num">${lowTps ? formatNumber(lowTps.tps, 1) : "-"}</div>
-                  <div class="stat-lbl">Lowest TPS<br>${lowTps ? escapeHtml(shortenModelName(lowTps.short, 16)) : "-"}</div>
+                  <div class="stat-lbl">Lowest TPS<br>${lowTps ? escapeHtml(lowTps.short) : "-"}</div>
                 </div>
               </div>
               <div>${speedRank}</div>
