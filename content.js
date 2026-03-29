@@ -74,6 +74,38 @@ function sleep(ms) {
 }
 
 /**
+ * Canvas To Blob.
+ */
+function canvasToBlob(canvas, type = "image/png") {
+  return new Promise((resolve, reject) => {
+    if (!(canvas instanceof HTMLCanvasElement) || typeof canvas.toBlob !== "function") {
+      reject(new Error("canvas_to_blob_unsupported"));
+      return;
+    }
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob);
+      else reject(new Error("canvas_to_blob_failed"));
+    }, type);
+  });
+}
+
+/**
+ * Trigger File Download.
+ */
+function triggerFileDownload(blob, filename) {
+  if (!(blob instanceof Blob)) throw new Error("download_blob_missing");
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename || `llamacpp-dashboard_${Date.now()}.png`;
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+/**
  * Load Image From Data Url.
  */
 function loadImageFromDataUrl(dataUrl) {
@@ -721,11 +753,9 @@ function perfSpeedBarRow(label, value, unit, pct, color, valueClass = "val", bad
   const shown = typeof value === "number" ? `${formatNumber(value, unit === "ms" ? 0 : 1)}${unit}` : "-";
   return `
     <div class="speed-bar-container">
-      <div class="speed-bar-label">
-        <span><span class="color-dot" style="background:${color}"></span>${badge}${escapeHtml(label)}</span>
-        <span class="${valueClass}">${shown}</span>
-      </div>
-      <div class="speed-bar"><div class="speed-bar-fill" style="width:${formatNumber(safePct, 1)}%;background:${color}">${shown}</div></div>
+      <div class="speed-bar-name"><span class="color-dot" style="background:${color}"></span>${badge}${escapeHtml(label)}</div>
+      <div class="speed-bar"><div class="speed-bar-fill" style="width:${formatNumber(safePct, 1)}%;background:${color}"></div></div>
+      <div class="speed-bar-value ${valueClass}">${shown}</div>
     </div>
   `;
 }
@@ -1175,6 +1205,35 @@ function adjustPerfFrontierChartHeight(root = __dashboardState.elements?.root) {
 }
 
 /**
+ * Align Simple Horizontal Bar Chart Label Widths.
+ */
+function adjustPerfSpeedBarLabelWidth(root = __dashboardState.elements?.root) {
+  if (!root) return;
+  const panels = Array.from(root.querySelectorAll(".perf-dashboard .card-panel"))
+    .filter((el) => el instanceof HTMLElement);
+  for (const panel of panels) {
+    const labels = Array.from(panel.querySelectorAll(".speed-bar-name, .consistency-name, .dumbbell-name, .box-name"))
+      .filter((el) => el instanceof HTMLElement);
+    const values = Array.from(panel.querySelectorAll(".speed-bar-value, .consistency-value, .dumbbell-values, .box-value"))
+      .filter((el) => el instanceof HTMLElement);
+    if (!labels.length) {
+      panel.style.removeProperty("--speed-bar-label-width");
+    } else {
+      const maxWidth = labels.reduce((acc, el) => Math.max(acc, el.scrollWidth || el.clientWidth || 0), 0);
+      const panelWidth = panel.clientWidth || 0;
+      const cappedWidth = panelWidth > 0 ? Math.max(140, Math.floor(panelWidth * 0.45)) : maxWidth + 8;
+      panel.style.setProperty("--speed-bar-label-width", `${Math.ceil(Math.min(maxWidth + 8, cappedWidth))}px`);
+    }
+    if (!values.length) {
+      panel.style.removeProperty("--speed-bar-value-width");
+      continue;
+    }
+    const maxValueWidth = values.reduce((acc, el) => Math.max(acc, el.scrollWidth || el.clientWidth || 0), 0);
+    panel.style.setProperty("--speed-bar-value-width", `${Math.ceil(maxValueWidth)}px`);
+  }
+}
+
+/**
  * Perf Hero Card.
  */
 function perfHeroCard(card) {
@@ -1255,10 +1314,7 @@ function perfRenderDumbbellRows(models) {
             <div class="dumbbell-point start" style="left:${formatNumber(start, 1)}%;background:${m.color}"></div>
             <div class="dumbbell-point end" style="left:${formatNumber(end, 1)}%;background:${m.color}"></div>
           </div>
-          <div class="dumbbell-values">
-            <span>${formatNumber(start, 0)}</span>
-            <span>${formatNumber(end, 0)}</span>
-          </div>
+          <div class="dumbbell-values">${formatNumber(start, 0)} | ${formatNumber(end, 0)}</div>
         </div>
       `;
     }).join("");
@@ -1307,8 +1363,7 @@ function perfRenderWaterfall(models) {
 function perfRenderRadar(models) {
   const selected = models
     .filter((m) => typeof m.promptThroughputScore === "number" || typeof m.outputThroughputScore === "number")
-    .sort((a, b) => (b.speedEfficiencyRatio || 0) - (a.speedEfficiencyRatio || 0))
-    .slice(0, 4);
+    .sort((a, b) => (b.speedEfficiencyRatio || 0) - (a.speedEfficiencyRatio || 0));
   if (selected.length < 2) {
     return `<div class="llm-empty">Select at least two models with timing data to render the radar profile.</div>`;
   }
@@ -1411,7 +1466,6 @@ function perfRenderBoxPlot(models) {
   const max = Math.max(...eligible.map((m) => m.ttftMax || 0), 1);
   return eligible
     .sort((a, b) => (a.ttftStd || 0) - (b.ttftStd || 0))
-    .slice(0, 8)
     .map((m) => {
       const minPct = ((m.ttftMin || 0) / max) * 100;
       const maxPct = ((m.ttftMax || 0) / max) * 100;
@@ -1445,7 +1499,7 @@ function perfRenderDashboardTemplate(records, summary, theme) {
     .filter((m) => m.modality !== "text-only" && typeof m.ttft === "number")
     .sort((a, b) => (a.ttft || 0) - (b.ttft || 0));
 
-  const ttftSorted = [...models].filter((m) => typeof m.ttft === "number").sort((a, b) => a.ttft - b.ttft).slice(0, 8);
+  const ttftSorted = [...models].filter((m) => typeof m.ttft === "number").sort((a, b) => a.ttft - b.ttft);
   const ttftMax = Math.max(...ttftSorted.map((m) => m.ttft || 0), 1);
   const ttftBars = ttftSorted.map((m, i) =>
     perfSpeedBarRow(m.short, m.ttft, "ms", 100 - (((m.ttft || 0) / ttftMax) * 100), m.color, "val", i < 3 ? ["🥇 ", "🥈 ", "🥉 "][i] : "")
@@ -1453,17 +1507,17 @@ function perfRenderDashboardTemplate(records, summary, theme) {
 
   const tpsSorted = [...models].filter((m) => typeof m.tps === "number").sort((a, b) => (b.tps || 0) - (a.tps || 0));
   const tpsMax = Math.max(...tpsSorted.map((m) => m.tps || 0), 1);
-  const tpsBars = tpsSorted.slice(0, 10).map((m, i) =>
+  const tpsBars = tpsSorted.map((m, i) =>
     perfSpeedBarRow(m.short, m.tps, "", ((m.tps || 0) / tpsMax) * 100, m.color, "val-blue", i < 3 ? ["🥇 ", "🥈 ", "🥉 "][i] : "")
   ).join("");
 
   const effSorted = [...sizedModels].filter((m) => typeof m.tpsPerB === "number").sort((a, b) => (b.tpsPerB || 0) - (a.tpsPerB || 0));
   const effMax = Math.max(...effSorted.map((m) => m.tpsPerB || 0), 1);
-  const effBars = effSorted.slice(0, 8).map((m, i) =>
+  const effBars = effSorted.map((m, i) =>
     perfSpeedBarRow(`${m.short} (${formatNumber(m.params, 1)}B)`, m.tpsPerB, "", ((m.tpsPerB || 0) / effMax) * 100, m.color, "val-blue", i < 3 ? ["🥇 ", "🥈 ", "🥉 "][i] : "")
   ).join("");
 
-  const speedRank = tpsSorted.slice(0, 7).map((m, i) => `
+  const speedRank = tpsSorted.map((m, i) => `
     <div class="consistency-row">
       <div class="consistency-name"><span class="color-dot" style="background:${m.color}"></span>${i === 0 ? "🥇 " : i === 1 ? "🥈 " : i === 2 ? "🥉 " : ""}${escapeHtml(m.short)}</div>
       <div class="consistency-bar-bg"><div class="consistency-bar-fill" style="width:${formatNumber(((m.tps || 0) / tpsMax) * 100, 1)}%;background:${m.color}"></div></div>
@@ -1583,13 +1637,6 @@ function perfRenderDashboardTemplate(records, summary, theme) {
               </div>
             </div>
 
-            <div class="card-panel full-width tone-blue" data-panel="punching-above-weight">
-              <h3 class="blue-header">PUNCHING ABOVE ITS WEIGHT</h3>
-              <div class="sub-label">This view compares actual output speed to the speed predicted by model size. It highlights which models are faster or slower than their parameter count would suggest.</div>
-              <div class="sub-label">Expected speed is estimated from the current comparison set using a parameter-size trendline.</div>
-              <div class="bullet-list">${bulletRows}</div>
-            </div>
-
             <div class="card-panel tone-orange" data-panel="quick-off-the-line">
               <h3 class="orange-header">QUICK OFF THE LINE OR BUILT FOR THE LONG RUN?</h3>
               <div class="sub-label">This chart compares response startup speed and sustained generation speed to show which models start quickly, which models sustain throughput, and which balance both.</div>
@@ -1638,7 +1685,7 @@ function perfRenderDashboardTemplate(records, summary, theme) {
             <div class="card-panel tone-blue" data-panel="vision-tax">
               <h3 class="blue-header">VISION PERFORMANCE</h3>
               <div class="sub-label">Vision-capable models should be judged on their own terms. Image handling adds latency and should be compared separately from text-only runs.</div>
-              <div>${visionModels.length ? visionModels.slice(0, 6).map((m, i) => perfSpeedBarRow(`${m.short} (${m.modality})`, m.ttft, "ms", 100 - (((m.ttft || 0) / Math.max(...visionModels.map((x) => x.ttft || 0), 1)) * 100), m.color, "val", i < 3 ? ["🥇 ", "🥈 ", "🥉 "][i] : "")).join("") : `<div class="llm-empty">Capture image prompts to populate this panel.</div>`}</div>
+              <div>${visionModels.length ? visionModels.map((m, i) => perfSpeedBarRow(`${m.short} (${m.modality})`, m.ttft, "ms", 100 - (((m.ttft || 0) / Math.max(...visionModels.map((x) => x.ttft || 0), 1)) * 100), m.color, "val", i < 3 ? ["🥇 ", "🥈 ", "🥉 "][i] : "")).join("") : `<div class="llm-empty">Capture image prompts to populate this panel.</div>`}</div>
               <div class="takeaway"><strong>NOTE:</strong> ${visionModels[0] ? `${escapeHtml(visionModels[0].short)} currently has the fastest successful-response vision TTFT at ${formatNumber(visionModels[0].ttft, 0)} ms.` : "Vision runs have not been captured in this filtered view."}</div>
             </div>
 
@@ -1707,6 +1754,7 @@ function renderDashboard(stats) {
   elements.bestCards.innerHTML = perfRenderDashboardTemplate(filtered, filteredSummary, __dashboardState.theme);
 
   requestAnimationFrame(() => {
+    adjustPerfSpeedBarLabelWidth(elements.root);
     adjustPerfFrontierChartHeight(elements.root);
     rerenderPerfFrontierScatter(elements.root, filtered);
   });
@@ -1834,12 +1882,17 @@ async function exportDashboardPng() {
     }
 
     if (!outCanvas) throw new Error("no_frames_captured");
-    const dataUrl = outCanvas.toDataURL("image/png");
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     const filename = `llamacpp-dashboard_${stamp}.png`;
-    const dl = await safeSendMessage({ type: "download_data_url", data_url: dataUrl, filename });
-    if (!dl?.ok) {
-      throw new Error(dl?.error || "download_failed");
+    try {
+      const blob = await canvasToBlob(outCanvas, "image/png");
+      triggerFileDownload(blob, filename);
+    } catch {
+      const dataUrl = outCanvas.toDataURL("image/png");
+      const dl = await safeSendMessage({ type: "download_data_url", data_url: dataUrl, filename });
+      if (!dl?.ok) {
+        throw new Error(dl?.error || "download_failed");
+      }
     }
     setDashboardStatus(`Exported PNG: ${filename}`);
   } catch (e) {
@@ -2025,7 +2078,7 @@ function mountDashboardUi() {
         font-weight: 600;
         cursor: pointer;
       }
-      .llm-body { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 14px; display: grid; gap: 12px; }
+      .llm-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 14px; display: grid; gap: 12px; }
       .llm-summary { display: flex; gap: 8px; flex-wrap: wrap; }
       .llm-chip {
         background: var(--llm-card);
@@ -2262,6 +2315,11 @@ function mountDashboardUi() {
         --accent-positive:  #3a7850;
         --accent-warn:      #a85040;
         --accent-gold:      #a88030;
+        --speed-bar-label-width: 320px;
+        --speed-bar-value-width: 72px;
+        --compare-bar-height: 17px;
+        --compare-row-space: 4px;
+        --compare-value-gap: 10px;
         --perf-font-display: "Unbounded", Impact, Haettenschweiler, "Arial Narrow Bold", sans-serif;
         --perf-font-head: "Open Sans", "Segoe UI", sans-serif;
         --perf-font-body: "Barlow Condensed", "Roboto Condensed", "Segoe UI", sans-serif;
@@ -2405,21 +2463,19 @@ function mountDashboardUi() {
       .perf-dashboard .full-width { flex-basis: 100% !important; width: 100%; }
       .perf-dashboard .main-grid > .best-class-row { flex-basis: 100%; width: 100%; }
       .perf-dashboard .main-grid > .card-panel[data-panel="size-speed-responsiveness"] { flex-basis: 100%; width: 100%; }
-      .perf-dashboard .main-grid > .card-panel[data-panel="punching-above-weight"] { flex-basis: 100%; width: 100%; }
       .perf-dashboard .main-grid > .card-panel[data-panel="latency-stability"] { flex-basis: 100%; width: 100%; }
       .perf-dashboard .main-grid > .card-panel[data-panel="model-personality"] { flex-basis: 100%; width: 100%; }
-      .perf-dashboard .main-grid > .best-class-row { order: 10; }
-      .perf-dashboard .main-grid > .card-panel[data-panel="ttft"] { order: 20; }
-      .perf-dashboard .main-grid > .card-panel[data-panel="tps"] { order: 30; }
-      .perf-dashboard .main-grid > .card-panel[data-panel="size-speed-responsiveness"] { order: 40; }
-      .perf-dashboard .main-grid > .card-panel[data-panel="punching-above-weight"] { order: 50; }
-      .perf-dashboard .main-grid > .card-panel[data-panel="quick-off-the-line"] { order: 60; }
-      .perf-dashboard .main-grid > .card-panel[data-panel="latency-anatomy"] { order: 70; }
-      .perf-dashboard .main-grid > .card-panel[data-panel="size-efficiency"] { order: 80; }
-      .perf-dashboard .main-grid > .card-panel[data-panel="model-personality"] { order: 90; }
-      .perf-dashboard .main-grid > .card-panel[data-panel="document-ingestion-efficiency"] { order: 100; }
-      .perf-dashboard .main-grid > .card-panel[data-panel="vision-tax"] { order: 110; }
-      .perf-dashboard .main-grid > .card-panel[data-panel="latency-stability"] { order: 120; }
+      .perf-dashboard .main-grid > .best-class-row { order: 0; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="ttft"] { order: 10; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="tps"] { order: 20; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="size-speed-responsiveness"] { order: 30; min-height: 400px; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="quick-off-the-line"] { order: 40; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="latency-anatomy"] { order: 50; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="size-efficiency"] { order: 60; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="model-personality"] { order: 70; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="document-ingestion-efficiency"] { order: 80; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="vision-tax"] { order: 90; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="latency-stability"] { order: 100; }
       .perf-dashboard .best-class-row {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -2516,9 +2572,9 @@ function mountDashboardUi() {
       .perf-dashboard .blue-header { background: color-mix(in srgb, var(--h3-bg-blue) 78%, transparent); color: var(--accent-secondary); border: 1px solid color-mix(in srgb, var(--accent-secondary) 28%, transparent); border-left: 4px solid var(--accent-secondary); }
       .perf-dashboard .dark-header { background: color-mix(in srgb, var(--h3-bg-dark) 92%, transparent); color: var(--text-primary); border: 1px solid color-mix(in srgb, var(--text-primary) 12%, var(--border-color)); border-left: 4px solid var(--accent-primary); }
       .perf-dashboard .sub-label { font-size: .74rem; color: var(--text-muted); margin-bottom: 8px; font-family: var(--perf-font-body); }
-      .perf-dashboard .speed-bar-container { margin: 4px 0; }
-      .perf-dashboard .speed-bar-label { font-size: .78rem; color: var(--text-secondary); display: flex; justify-content: space-between; gap: 8px; margin-bottom: 2px; font-family: var(--perf-font-body); }
-      .perf-dashboard .speed-bar-label > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .perf-dashboard .speed-bar-container { margin: var(--compare-row-space) 0; display: grid; grid-template-columns: var(--speed-bar-label-width) minmax(160px, 1fr) var(--speed-bar-value-width); align-items: center; column-gap: var(--compare-value-gap); row-gap: 0; }
+      .perf-dashboard .speed-bar-name { min-width: 0; font-size: .78rem; color: var(--text-secondary); display: flex; align-items: flex-start; white-space: normal; overflow-wrap: anywhere; line-height: 1.15; font-family: var(--perf-font-body); }
+      .perf-dashboard .speed-bar-value { font-size: .78rem; text-align: right; white-space: nowrap; font-family: var(--perf-font-body); }
       .perf-dashboard .val, .perf-dashboard .val-blue, .perf-dashboard .val-green, .perf-dashboard .val-warn { font-weight: 700; }
       .perf-dashboard .val, .perf-dashboard .val-blue, .perf-dashboard .val-green, .perf-dashboard .val-warn,
       .perf-dashboard .speed-bar-fill,
@@ -2531,7 +2587,7 @@ function mountDashboardUi() {
       .perf-dashboard .val-blue { color: var(--accent-secondary); }
       .perf-dashboard .val-green { color: var(--accent-positive); }
       .perf-dashboard .val-warn { color: var(--accent-warn); }
-      .perf-dashboard .speed-bar { height: 17px; border-radius: 3px; background: var(--bg-bar-track); overflow: hidden; }
+      .perf-dashboard .speed-bar { height: var(--compare-bar-height); border-radius: 3px; background: var(--bg-bar-track); overflow: hidden; min-width: 0; }
       .perf-dashboard .speed-bar-fill {
         height: 100%; border-radius: 3px; display: flex; align-items: center; padding-left: 5px;
         font-size: .63rem; font-weight: 700; color: rgba(255,255,255,.9); opacity: .85;
@@ -2559,14 +2615,14 @@ function mountDashboardUi() {
       }
       .perf-dashboard .vision-name, .perf-dashboard .stat-lbl { font-size: .66rem; color: var(--text-muted); margin-top: 2px; line-height: 1.25; font-family: var(--perf-font-body); }
       .perf-dashboard .vision-delta { font-size: .62rem; color: var(--accent-warn); margin-top: 2px; font-family: var(--perf-font-body); }
-      .perf-dashboard .consistency-row { display:flex; align-items:center; gap:6px; margin:3px 0; }
-      .perf-dashboard .consistency-name { width: 150px; flex-shrink:0; font-size:.72rem; color:var(--text-secondary); display:flex; align-items:center; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-family: var(--perf-font-body); }
-      .perf-dashboard .consistency-bar-bg { flex:1; height:13px; background:var(--bg-bar-track); border-radius:3px; overflow:hidden; }
+      .perf-dashboard .consistency-row { display:grid; grid-template-columns: var(--speed-bar-label-width) minmax(160px, 1fr) var(--speed-bar-value-width); align-items:center; column-gap: var(--compare-value-gap); row-gap: 0; margin:var(--compare-row-space) 0; }
+      .perf-dashboard .consistency-name { min-width: 0; font-size:.72rem; color:var(--text-secondary); display:flex; align-items:flex-start; white-space:normal; overflow-wrap:anywhere; line-height:1.15; font-family: var(--perf-font-body); }
+      .perf-dashboard .consistency-bar-bg { height:var(--compare-bar-height); background:var(--bg-bar-track); border-radius:3px; overflow:hidden; min-width:0; }
       .perf-dashboard .consistency-bar-fill { height:100%; border-radius:3px; opacity:.78; }
-      .perf-dashboard .consistency-value { width:54px; text-align:right; font-size:.66rem; font-weight:700; }
+      .perf-dashboard .consistency-value { text-align:right; font-size:.66rem; font-weight:700; white-space:nowrap; }
       .perf-dashboard .chart-container { background: var(--bg-inset); border-radius: 5px; overflow: hidden; border:1px solid var(--border-color); }
-      .perf-dashboard .frontier-grid { display:grid; grid-template-columns: 2fr 1fr; gap: 12px; }
-      .perf-dashboard .frontier-chart { height: 220px; }
+      .perf-dashboard .frontier-grid { display:grid; grid-template-columns: 2fr 1fr; gap: 12px; min-height: calc(400px - 96px); }
+      .perf-dashboard .frontier-chart { height: 100%; min-height: 260px; }
       .perf-dashboard .perf-scatter-svg { width: 100%; height: 100%; display: block; }
       .perf-dashboard .scatter-grid { stroke: var(--canvas-grid); stroke-width: 1; }
       .perf-dashboard .scatter-axis { stroke: var(--canvas-text); stroke-width: 1.2; }
@@ -2597,20 +2653,26 @@ function mountDashboardUi() {
       .perf-dashboard .legend-title { font-size:.82rem; font-weight:800; color:var(--accent-primary); margin-bottom:6px; letter-spacing:.6px; font-family: var(--perf-font-head); }
       .perf-dashboard .legend-item { display:flex; align-items:center; gap:6px; font-size:.74rem; color:var(--text-secondary); margin:2px 0; line-height:1.3; font-family: var(--perf-font-body); }
       .perf-dashboard .legend-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; opacity:.85; }
-      .perf-dashboard .radar-wrap { display:grid; gap: 14px; }
-      .perf-dashboard .radar-grid { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); align-items: stretch; }
+      .perf-dashboard .radar-wrap { display:grid; }
+      .perf-dashboard .radar-grid { display:grid; grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: start; row-gap: 22px; column-gap: 14px; }
       .perf-dashboard .radar-card {
         background: var(--bg-inset);
         border: 1px solid var(--border-color);
         border-radius: 10px;
         padding: 10px;
+        display: grid;
+        grid-template-rows: auto auto auto auto;
+        align-content: start;
+        align-self: start;
+        justify-self: stretch;
       }
       .perf-dashboard .radar-card-head {
         display:flex;
         justify-content:space-between;
         gap: 10px;
-        align-items:center;
+        align-items:flex-start;
         margin-bottom: 8px;
+        min-height: 38px;
       }
       .perf-dashboard .radar-card-title {
         min-width: 0;
@@ -2628,7 +2690,7 @@ function mountDashboardUi() {
         letter-spacing: .06em;
         font-family: var(--perf-font-head);
       }
-      .perf-dashboard .radar-svg { width: 100%; height: auto; display: block; }
+      .perf-dashboard .radar-svg { width: 100%; height: auto; display: block; aspect-ratio: 13 / 9; min-height: 260px; }
       .perf-dashboard .radar-ring { fill: rgba(255,255,255,0.02); stroke: var(--canvas-grid); stroke-width: 1; }
       .perf-dashboard .radar-axis { stroke: var(--canvas-grid); stroke-width: 1; }
       .perf-dashboard .radar-label { fill: var(--text-secondary); font-size: 10px; font-family: var(--perf-font-head); }
@@ -2661,21 +2723,24 @@ function mountDashboardUi() {
         font-size: .69rem;
         line-height: 1.35;
       }
-      .perf-dashboard .bullet-list, .perf-dashboard .dumbbell-list, .perf-dashboard .box-list { display: grid; gap: 10px; }
+      .perf-dashboard .radar-interpret { min-height: 0; }
+      .perf-dashboard .bullet-list, .perf-dashboard .dumbbell-list, .perf-dashboard .box-list { display: grid; gap: var(--compare-row-space); }
       .perf-dashboard .bullet-row, .perf-dashboard .dumbbell-row, .perf-dashboard .box-row {
         background: var(--bg-inset);
         border: 1px solid var(--border-color);
         border-radius: 8px;
-        padding: 9px 10px;
+        padding: 0px 10px;
       }
       .perf-dashboard .bullet-head, .perf-dashboard .bullet-foot { display:flex; justify-content:space-between; gap:8px; align-items:center; }
       .perf-dashboard .bullet-name, .perf-dashboard .box-name, .perf-dashboard .dumbbell-name {
         min-width: 0;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
         color: var(--text-secondary);
         font-size: .74rem;
+        display: flex;
+        align-items: flex-start;
+        white-space: normal;
+        overflow-wrap: anywhere;
+        line-height: 1.15;
       }
       .perf-dashboard .bullet-meta, .perf-dashboard .bullet-foot, .perf-dashboard .box-value, .perf-dashboard .waterfall-value {
         font-family: var(--perf-font-mono);
@@ -2721,42 +2786,49 @@ function mountDashboardUi() {
       }
       .perf-dashboard .dumbbell-row {
         display:grid;
-        grid-template-columns: 150px 1fr 72px;
-        gap: 10px;
+        grid-template-columns: var(--speed-bar-label-width) minmax(160px, 1fr) var(--speed-bar-value-width);
+        column-gap: var(--compare-value-gap);
+        row-gap: 0;
         align-items: center;
       }
       .perf-dashboard .dumbbell-track {
         position: relative;
-        height: 22px;
+        height: var(--compare-bar-height);
       }
       .perf-dashboard .dumbbell-line {
         position:absolute;
-        top: 10px;
+        top: 7px;
         height: 2px;
         background: color-mix(in srgb, var(--accent-secondary) 40%, var(--accent-primary));
       }
       .perf-dashboard .dumbbell-point {
         position:absolute;
-        top: 4px;
-        width: 14px;
-        height: 14px;
+        top: 2px;
+        width: 12px;
+        height: 12px;
         border-radius: 50%;
         transform: translateX(-50%);
         border: 2px solid rgba(255,255,255,.75);
       }
       .perf-dashboard .dumbbell-point.end {
-        width: 12px;
-        height: 12px;
-        top: 5px;
+        width: 10px;
+        height: 10px;
+        top: 3px;
         border-color: rgba(0,0,0,.18);
       }
       .perf-dashboard .dumbbell-values {
-        display:flex;
-        justify-content:space-between;
-        gap: 6px;
+        text-align:right;
         font-family: var(--perf-font-mono);
         font-size: .68rem;
         color: var(--text-secondary);
+        white-space: nowrap;
+      }
+      .perf-dashboard .box-row {
+        display:grid;
+        grid-template-columns: var(--speed-bar-label-width) minmax(160px, 1fr) var(--speed-bar-value-width);
+        column-gap: var(--compare-value-gap);
+        row-gap: 0;
+        align-items:center;
       }
       .perf-dashboard .waterfall-shell { display:grid; gap: 8px; }
       .perf-dashboard .waterfall-stage {
@@ -2773,17 +2845,17 @@ function mountDashboardUi() {
         border-radius: 999px;
         opacity: .92;
       }
-      .perf-dashboard .box-track { height: 18px; }
+      .perf-dashboard .box-track { height: var(--compare-bar-height); }
       .perf-dashboard .box-whisker {
         position:absolute;
-        top: 8px;
+        top: 7px;
         height: 2px;
         background: var(--text-muted);
       }
       .perf-dashboard .box-rect {
         position:absolute;
-        top: 3px;
-        bottom: 3px;
+        top: 2px;
+        bottom: 2px;
         border-radius: 4px;
         opacity: .8;
       }
@@ -2946,7 +3018,7 @@ function mountDashboardUi() {
         .perf-dashboard .main-grid > * { flex-basis: 100%; }
         .perf-dashboard .best-class-row { grid-template-columns: 1fr; }
         .perf-dashboard .frontier-grid { grid-template-columns: 1fr; }
-        .perf-dashboard .radar-grid { grid-template-columns: 1fr; }
+        .perf-dashboard .radar-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         .perf-dashboard .doc-ingestion-grid { grid-template-columns: 1fr; }
         .perf-dashboard .stability-grid { grid-template-columns: 1fr; }
         .perf-dashboard .dumbbell-row,
@@ -2964,7 +3036,6 @@ function mountDashboardUi() {
         .perf-dashboard .header-meta-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         .perf-dashboard .header-meta-item { justify-items: start; }
         .perf-dashboard .two-col-grid { grid-template-columns: 1fr; }
-        .perf-dashboard .consistency-name { width: 120px; }
       }
     </style>
     <button class="llm-tab" id="llm-tab">^ Aggregate UI Metrics</button>
@@ -3083,6 +3154,7 @@ function mountDashboardUi() {
   }, true);
   window.addEventListener("resize", () => {
     if (!__dashboardState.overlayOpen) return;
+    adjustPerfSpeedBarLabelWidth(root);
     adjustPerfFrontierChartHeight(root);
     const stats = __dashboardState.lastStats;
     const baseRecords = Array.isArray(stats?.records_compact) ? stats.records_compact : [];
