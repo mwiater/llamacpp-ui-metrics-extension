@@ -1171,6 +1171,44 @@ function rerenderPerfFrontierScatter(root, records) {
   chartWrap.innerHTML = perfRenderScatterSvg(models, { W, H });
 }
 
+function bindPerfParallelCoordinatesHover(root = __dashboardState.elements?.root) {
+  if (!root) return;
+  const panel = root.querySelector('.perf-dashboard .card-panel[data-panel="parallel-coordinates"]');
+  if (!(panel instanceof HTMLElement)) return;
+
+  const setActiveKey = (key = "") => {
+    const active = String(key || "");
+    panel.querySelectorAll(".pc-model").forEach((el) => {
+      if (!(el instanceof Element)) return;
+      el.classList.toggle("is-dimmed", !!active && el.getAttribute("data-model-key") !== active);
+      el.classList.toggle("is-active", !!active && el.getAttribute("data-model-key") === active);
+    });
+    panel.querySelectorAll(".pc-legend-item").forEach((el) => {
+      if (!(el instanceof HTMLElement)) return;
+      el.classList.toggle("is-dimmed", !!active && el.dataset.modelKey !== active);
+      el.classList.toggle("is-active", !!active && el.dataset.modelKey === active);
+    });
+  };
+
+  panel.onmouseover = (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const legend = target.closest(".pc-legend-item");
+    if (legend instanceof HTMLElement) {
+      setActiveKey(legend.dataset.modelKey || "");
+      return;
+    }
+    const model = target.closest(".pc-model");
+    setActiveKey(model instanceof Element ? model.getAttribute("data-model-key") || "" : "");
+  };
+
+  panel.onmouseout = (event) => {
+    const related = event.relatedTarget;
+    if (related instanceof Node && panel.contains(related)) return;
+    setActiveKey("");
+  };
+}
+
 /**
  * Adjust Perf Frontier Chart Height.
  */
@@ -1195,13 +1233,10 @@ function adjustPerfFrontierChartHeight(root = __dashboardState.elements?.root) {
     10 + // title bottom margin in design
     8;   // subtitle bottom spacing
 
-  const available = Math.floor(card.clientHeight - padTop - padBottom - occupied);
-  const nextHeight = Math.max(260, available);
+  const nextHeight = 500;
 
   chartWrap.style.height = `${nextHeight}px`;
-
-  // Keep legend column visually aligned when the card is stretched by the grid row.
-  grid.style.alignItems = "stretch";
+  grid.style.alignItems = "start";
 }
 
 /**
@@ -1385,10 +1420,10 @@ function perfRenderRadar(models) {
     return model[key] ?? 50;
   });
   const W = 520;
-  const H = 360;
+  const H = 332;
   const cx = W / 2;
-  const cy = H / 2 + 10;
-  const radius = 118;
+  const cy = H / 2 + 6;
+  const radius = 92;
   const pointFor = (angle, value) => {
     const r = (Math.max(0, Math.min(100, value)) / 100) * radius;
     return [cx + Math.cos(angle) * r, cy + Math.sin(angle) * r];
@@ -1403,7 +1438,7 @@ function perfRenderRadar(models) {
   const axisHtml = axes.map(([label], i) => {
     const angle = (-Math.PI / 2) + (i * Math.PI * 2 / axes.length);
     const [x, y] = pointFor(angle, 100);
-    const [lx, ly] = pointFor(angle, 116);
+    const [lx, ly] = pointFor(angle, 102);
     return `
       <line x1="${cx}" y1="${cy}" x2="${x}" y2="${y}" class="radar-axis"></line>
       <text x="${lx}" y="${ly}" class="radar-label" text-anchor="middle">${escapeHtml(label)}</text>
@@ -1487,6 +1522,347 @@ function perfRenderBoxPlot(models) {
 }
 
 /**
+ * Perf Render Parallel Coordinates.
+ */
+function perfRenderParallelCoordinates(models) {
+  const eligible = models.filter((m) => typeof m.tps === "number" || typeof m.promptTps === "number");
+  if (eligible.length < 2) {
+    return `<div class="llm-empty">Need at least two models with timing data to render parallel coordinates.</div>`;
+  }
+  const pcModelKey = (value) => String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "model";
+
+  const axes = [
+    { key: "promptTps", label: "Prompt Eval", unit: "t/s", higher: true, log: true },
+    { key: "tps", label: "Gen Speed", unit: "t/s", higher: true, log: true },
+    { key: "ttft", label: "TTFB", unit: "ms", higher: false, log: true },
+    { key: "totalDuration", label: "Wall Time", unit: "ms", higher: false, log: true },
+    { key: "predictedN", label: "Output Tokens", unit: "tok", higher: true, log: true },
+    { key: "reasoningPct", label: "Reasoning %", unit: "%", higher: null, log: false }
+  ];
+
+  const scales = axes.map((ax) => {
+    const vals = eligible.map((m) => toFiniteNumber(m[ax.key])).filter((x) => x !== null && x > 0);
+    if (!vals.length) return { min: 0, max: 1, empty: true, log: false };
+    let lo, hi;
+    if (ax.log) {
+      const safe = vals.map((v) => Math.log10(Math.max(v, 0.1)));
+      lo = Math.min(...safe);
+      hi = Math.max(...safe);
+    } else {
+      lo = Math.min(...vals);
+      hi = Math.max(...vals);
+    }
+    const range = hi - lo || 1;
+    return { min: lo - range * 0.06, max: hi + range * 0.06, log: ax.log };
+  });
+
+  const W = 1480;
+  const H = 280;
+  const pad = { t: 34, b: 34, l: 52, r: 52 };
+  const plotW = W - pad.l - pad.r;
+  const plotH = H - pad.t - pad.b;
+  const axisX = axes.map((_, i) => pad.l + (i / Math.max(1, axes.length - 1)) * plotW);
+
+  const pcYPos = (axIdx, value) => {
+    const s = scales[axIdx];
+    const ax = axes[axIdx];
+    const v = toFiniteNumber(value);
+    if (v === null || v <= 0) return pad.t + plotH / 2;
+    const mapped = s.log ? Math.log10(Math.max(v, 0.1)) : v;
+    const norm = (mapped - s.min) / Math.max(1e-9, s.max - s.min);
+    const flipped = ax.higher === false ? norm : 1 - norm;
+    return pad.t + Math.max(0, Math.min(1, flipped)) * plotH;
+  };
+
+  const pcBuildPath = (model) => {
+    const pts = axes.map((ax, i) => ({ x: axisX[i], y: pcYPos(i, model[ax.key]) }));
+    let d = `M ${pts[0].x.toFixed(1)} ${pts[0].y.toFixed(1)}`;
+    for (let i = 1; i < pts.length; i++) {
+      const cpx = ((pts[i - 1].x + pts[i].x) / 2).toFixed(1);
+      d += ` C ${cpx} ${pts[i - 1].y.toFixed(1)}, ${cpx} ${pts[i].y.toFixed(1)}, ${pts[i].x.toFixed(1)} ${pts[i].y.toFixed(1)}`;
+    }
+    return d;
+  };
+
+  const pcFormatVal = (ax, value) => {
+    const v = toFiniteNumber(value);
+    if (v === null) return "-";
+    if (ax.key === "reasoningPct") return `${formatNumber(v, 0)}%`;
+    if (ax.key === "ttft" || ax.key === "totalDuration") {
+      return v >= 1000 ? `${formatNumber(v / 1000, 1)}s` : `${formatNumber(v, 0)}ms`;
+    }
+    if (ax.key === "predictedN") return formatInt(v);
+    return `${formatNumber(v, 1)}`;
+  };
+
+  const axesSvg = axes.map((ax, i) => {
+    const x = axisX[i];
+    const dirLabel = ax.higher === true ? "\u25B2 better" : ax.higher === false ? "\u25B2 better" : "info";
+    const dirCls = ax.higher === true ? "pc-dir-good" : ax.higher === false ? "pc-dir-cost" : "pc-dir-info";
+    const ticks = [0, 0.25, 0.5, 0.75, 1].map((t) =>
+      `<circle cx="${x}" cy="${(pad.t + t * plotH).toFixed(1)}" r="1.4" class="pc-tick"/>`
+    ).join("");
+    return `
+      <line x1="${x}" y1="${pad.t}" x2="${x}" y2="${(pad.t + plotH).toFixed(1)}" class="pc-axis-line"/>
+      ${ticks}
+      <text x="${x}" y="${(pad.t + plotH + 16).toFixed(1)}" class="pc-axis-label" text-anchor="middle">${escapeHtml(ax.label)}</text>
+      ${ax.unit ? `<text x="${x}" y="${(pad.t + plotH + 28).toFixed(1)}" class="pc-axis-unit" text-anchor="middle">${escapeHtml(ax.unit)}</text>` : ""}
+      <text x="${x}" y="${(pad.t - 10).toFixed(1)}" class="pc-dir-label ${dirCls}" text-anchor="middle">${escapeHtml(dirLabel)}</text>
+    `;
+  }).join("");
+
+  const modelsSvg = eligible.map((m) => {
+    const modelKey = pcModelKey(m.model || m.short || "");
+    const d = pcBuildPath(m);
+    const titleParts = [
+      m.model,
+      ...axes.map((ax) => `${ax.label}: ${pcFormatVal(ax, m[ax.key])}`)
+    ];
+    const dots = axes.map((ax, ai) => {
+      const x = axisX[ai];
+      const y = pcYPos(ai, m[ax.key]);
+      return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="3.5" fill="${m.color}" class="pc-dot"/>`;
+    }).join("");
+    return `
+      <g class="pc-model" data-model-key="${escapeHtml(modelKey)}">
+        <path d="${d}" stroke="transparent" stroke-width="16" fill="none" class="pc-path-hit"/>
+        <path d="${d}" stroke="${m.color}" fill="none" class="pc-path-vis">
+          <title>${escapeHtml(titleParts.join(" | "))}</title>
+        </path>
+        ${dots}
+      </g>
+    `;
+  }).join("");
+
+  const legendHtml = eligible.map((m) => `
+    <div class="pc-legend-item" data-model-key="${escapeHtml(pcModelKey(m.model || m.short || ""))}">
+      <span class="pc-legend-swatch" style="background:${m.color}"></span>
+      <span>${escapeHtml(m.short)}</span>
+    </div>
+  `).join("");
+
+  const fastest = eligible.filter((m) => typeof m.tps === "number").sort((a, b) => (b.tps || 0) - (a.tps || 0))[0];
+  const bestPrompt = eligible.filter((m) => typeof m.promptTps === "number").sort((a, b) => (b.promptTps || 0) - (a.promptTps || 0))[0];
+  const heaviestReasoner = eligible.filter((m) => (m.reasoningPct || 0) > 0).sort((a, b) => (b.reasoningPct || 0) - (a.reasoningPct || 0))[0];
+
+  const takeawayParts = [];
+  if (bestPrompt) takeawayParts.push(`${escapeHtml(bestPrompt.short)} leads prompt eval at ${formatNumber(bestPrompt.promptTps, 0)} t/s.`);
+  if (fastest) takeawayParts.push(`${escapeHtml(fastest.short)} tops generation speed at ${formatNumber(fastest.tps, 1)} t/s.`);
+  if (heaviestReasoner) takeawayParts.push(`${escapeHtml(heaviestReasoner.short)} uses ${formatNumber(heaviestReasoner.reasoningPct, 0)}% reasoning tokens.`);
+
+  return `
+    <svg viewBox="0 0 ${W} ${H}" class="pc-chart" preserveAspectRatio="xMidYMid meet">
+      ${axesSvg}
+      ${modelsSvg}
+    </svg>
+    <div class="pc-legend">${legendHtml}</div>
+    <div class="takeaway"><strong>TAKEAWAY:</strong> ${takeawayParts.join(" ") || "Hover each model line to compare its full performance profile across all axes."}</div>
+  `;
+}
+
+/**
+ * Perf Render Token Mosaic.
+ */
+function perfRenderTokenMosaic(models) {
+  const eligible = models
+    .filter((m) => typeof m.predictedN === "number" && m.predictedN > 0)
+    .sort((a, b) => (b.predictedN || 0) - (a.predictedN || 0));
+  if (eligible.length < 2) {
+    return `<div class="llm-empty">Need at least two models with output token data to render the token mosaic.</div>`;
+  }
+
+  const rowsHtml = eligible.map((m) => {
+    const reasoningFrac = Math.max(0, Math.min(1, (m.reasoningPct || 0) / 100));
+    const contentFrac = 1 - reasoningFrac;
+    const reasoningN = Math.round((m.predictedN || 0) * reasoningFrac);
+    const contentN = (m.predictedN || 0) - reasoningN;
+    const titleLines = [
+      `${m.model}`,
+      `Total: ${formatInt(m.predictedN)} tokens`,
+      `Reasoning: ${formatInt(reasoningN)} (${formatNumber(reasoningFrac * 100, 0)}%)`,
+      `Content: ${formatInt(contentN)} (${formatNumber(contentFrac * 100, 0)}%)`
+    ];
+    const reasoningLabel = reasoningFrac >= 0.16
+      ? `<div class="tm-seg-label tm-seg-label-reason">${formatNumber(reasoningFrac * 100, 0)}%</div>`
+      : "";
+    const contentLabel = contentFrac >= 0.18
+      ? `<div class="tm-seg-label tm-seg-label-content">${formatInt(contentN)}</div>`
+      : "";
+    return `
+      <div class="tm-stage" title="${escapeHtml(titleLines.join(" | "))}">
+        <div class="tm-name"><span class="color-dot" style="background:${m.color}"></span>${escapeHtml(m.short)}</div>
+        <div class="tm-track-shell">
+          <div class="tm-track">
+            ${reasoningFrac > 0 ? `<div class="tm-bar tm-bar-reason" style="width:${formatNumber(reasoningFrac * 100, 1)}%">${reasoningLabel}</div>` : ""}
+            <div class="tm-bar tm-bar-content" style="left:${formatNumber(reasoningFrac * 100, 1)}%;width:${formatNumber(contentFrac * 100, 1)}%">${contentLabel}</div>
+          </div>
+          <div class="tm-meta">
+            <span>${formatNumber(reasoningFrac * 100, 0)}% reasoning</span>
+            <span>${formatNumber(contentFrac * 100, 0)}% content</span>
+          </div>
+        </div>
+        <div class="tm-total">${formatInt(m.predictedN)} tok</div>
+      </div>
+    `;
+  }).join("");
+
+  const heaviest = eligible.filter((m) => (m.reasoningPct || 0) > 0).sort((a, b) => (b.reasoningPct || 0) - (a.reasoningPct || 0))[0];
+  const leanest = eligible.filter((m) => typeof m.predictedN === "number").sort((a, b) => (a.predictedN || 0) - (b.predictedN || 0))[0];
+  const takeawayParts = [];
+  if (heaviest) takeawayParts.push(`${escapeHtml(heaviest.short)} devotes ${formatNumber(heaviest.reasoningPct, 0)}% of output to reasoning.`);
+  if (leanest) takeawayParts.push(`${escapeHtml(leanest.short)} is the most concise at ${formatInt(leanest.predictedN)} total tokens.`);
+
+  return `
+    <div class="tm-scale"><span>0%</span><span>Reasoning mix</span><span>100%</span></div>
+    <div class="tm-shell">${rowsHtml}</div>
+    <div class="tm-legend">
+      <div class="tm-legend-item"><span class="tm-swatch tm-swatch-reason"></span><span>Reasoning tokens (internal)</span></div>
+      <div class="tm-legend-item"><span class="tm-swatch tm-swatch-content"></span><span>Content tokens (user-facing)</span></div>
+    </div>
+    <div class="takeaway"><strong>TAKEAWAY:</strong> ${takeawayParts.join(" ") || "Compare reasoning overhead across models."}</div>
+  `;
+}
+
+/**
+ * Perf Render Pareto Frontier.
+ */
+function perfRenderParetoFrontier(models) {
+  const eligible = models.filter((m) => typeof m.params === "number" && m.params > 0 && typeof m.tps === "number" && m.tps > 0);
+  if (eligible.length < 3) {
+    return `<div class="llm-empty">Need at least three models with parseable parameter counts and generation speed to render the efficiency frontier.</div>`;
+  }
+
+  const sorted = [...eligible].sort((a, b) => a.params - b.params);
+
+  const frontier = [];
+  let bestTps = -1;
+  for (const m of sorted) {
+    if (m.tps > bestTps) {
+      frontier.push(m);
+      bestTps = m.tps;
+    }
+  }
+  const frontierSet = new Set(frontier.map((m) => m.model));
+
+  const W = 1520;
+  const H = 260;
+  const pad = { t: 28, b: 40, l: 56, r: 34 };
+  const plotW = W - pad.l - pad.r;
+  const plotH = H - pad.t - pad.b;
+
+  const paramsVals = eligible.map((m) => m.params);
+  const tpsVals = eligible.map((m) => m.tps);
+  const minX = Math.max(0, Math.min(...paramsVals) * 0.85);
+  const maxX = Math.max(...paramsVals) * 1.1;
+  const minY = 0;
+  const maxY = Math.ceil(Math.max(...tpsVals) * 1.12 / 10) * 10;
+
+  const xp = (v) => pad.l + ((v - minX) / Math.max(1, maxX - minX)) * plotW;
+  const yp = (v) => H - pad.b - ((v - minY) / Math.max(1, maxY - minY)) * plotH;
+
+  const xTicks = 5;
+  const yTicks = 4;
+  const gridSvg = Array.from({ length: yTicks + 1 }, (_, i) => {
+    const v = minY + i * ((maxY - minY) / yTicks);
+    const y = yp(v);
+    return `
+      <line x1="${pad.l}" y1="${y.toFixed(1)}" x2="${(W - pad.r).toFixed(1)}" y2="${y.toFixed(1)}" class="pf-grid"/>
+      <text class="pf-tick" x="${(pad.l - 6).toFixed(1)}" y="${(y + 1).toFixed(1)}" text-anchor="end">${Math.round(v)}</text>
+    `;
+  }).join("") + Array.from({ length: xTicks + 1 }, (_, i) => {
+    const v = minX + i * ((maxX - minX) / xTicks);
+    const x = xp(v);
+    return `
+      <line x1="${x.toFixed(1)}" y1="${pad.t.toFixed(1)}" x2="${x.toFixed(1)}" y2="${(H - pad.b).toFixed(1)}" class="pf-grid"/>
+      <text class="pf-tick" x="${x.toFixed(1)}" y="${(H - pad.b + 16).toFixed(1)}" text-anchor="middle">${formatNumber(v, 0)}B</text>
+    `;
+  }).join("");
+
+  const frontierPath = (() => {
+    if (frontier.length < 2) return "";
+    const pts = frontier.map((m) => `${xp(m.params).toFixed(1)},${yp(m.tps).toFixed(1)}`);
+    const fillPts = [
+      ...frontier.map((m) => `${xp(m.params).toFixed(1)},${yp(m.tps).toFixed(1)}`),
+      `${xp(frontier[frontier.length - 1].params).toFixed(1)},${yp(maxY).toFixed(1)}`,
+      `${xp(frontier[0].params).toFixed(1)},${yp(maxY).toFixed(1)}`
+    ];
+    const zoneLabelX = xp(frontier[0].params) + 8;
+    const zoneLabelY = Math.min(H - pad.b - 10, yp(maxY) + 18);
+    return `
+      <polygon points="${fillPts.join(" ")}" class="pf-zone"/>
+      <text class="pf-zone-label" x="${zoneLabelX.toFixed(1)}" y="${zoneLabelY.toFixed(1)}">Efficient frontier zone</text>
+      <polyline points="${pts.join(" ")}" fill="none" class="pf-line"/>
+    `;
+  })();
+
+  const placedLabels = [];
+  const dotsSvg = eligible.map((m) => {
+    const x = xp(m.params);
+    const y = yp(m.tps);
+    const onFrontier = frontierSet.has(m.model);
+    const cls = onFrontier ? "pf-dot-frontier" : "pf-dot-dominated";
+    const r = onFrontier ? 4.1 : 2.9;
+    const haloR = onFrontier ? 7.2 : 0;
+    const titleParts = [
+      m.model,
+      `${formatNumber(m.params, 1)}B params`,
+      `${formatNumber(m.tps, 1)} t/s`,
+      onFrontier ? "On the Pareto frontier" : "Dominated"
+    ];
+    let labelAnchor = x > (W / 2) ? "end" : "start";
+    if (x < pad.l + 72) labelAnchor = "start";
+    if (x > (W - pad.r - 72)) labelAnchor = "end";
+    const labelDx = labelAnchor === "end" ? -(r + 3) : (r + 3);
+    const labelY = Math.max(pad.t + 10, y - (r + 3));
+    const shortLabel = m.short.length > 24 ? `${m.short.slice(0, 24)}...` : m.short;
+    const estLabelW = Math.max(28, shortLabel.length * 4.2);
+    const labelLeft = labelAnchor === "end" ? (x + labelDx - estLabelW) : (x + labelDx);
+    const labelTop = labelY - 7;
+    const labelBox = { left: labelLeft, right: labelLeft + estLabelW, top: labelTop, bottom: labelTop + 10 };
+    const overlaps = placedLabels.some((b) =>
+      !(labelBox.right < b.left || labelBox.left > b.right || labelBox.bottom < b.top || labelBox.top > b.bottom)
+    );
+    const showLabel = onFrontier || !overlaps;
+    if (showLabel) placedLabels.push(labelBox);
+    return `
+      <g class="pf-model">
+        ${onFrontier ? `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${haloR}" class="pf-halo"/>` : ""}
+        ${!onFrontier ? `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${(r + 2.2).toFixed(1)}" class="pf-bubble"/>` : ""}
+        <circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${r}" class="${cls}">
+          <title>${escapeHtml(titleParts.join(" | "))}</title>
+        </circle>
+        ${showLabel ? `<text class="pf-label ${onFrontier ? "pf-label-frontier" : ""}" x="${(x + labelDx).toFixed(1)}" y="${labelY.toFixed(1)}" text-anchor="${labelAnchor}">${escapeHtml(shortLabel)}</text>` : ""}
+      </g>
+    `;
+  }).join("");
+
+  const frontierNames = frontier.map((m) => escapeHtml(m.short));
+  const takeaway = frontierNames.length
+    ? `${frontierNames.join(" and ")} ${frontierNames.length === 1 ? "sits" : "sit"} on the Pareto frontier — no other model is both smaller and faster.`
+    : "Not enough data to compute a frontier.";
+
+  return `
+    <svg viewBox="0 0 ${W} ${H}" class="pf-chart" preserveAspectRatio="xMidYMid meet">
+      <line x1="${pad.l}" y1="${(H - pad.b).toFixed(1)}" x2="${(W - pad.r).toFixed(1)}" y2="${(H - pad.b).toFixed(1)}" class="pf-axis"/>
+      <line x1="${pad.l}" y1="${pad.t.toFixed(1)}" x2="${pad.l}" y2="${(H - pad.b).toFixed(1)}" class="pf-axis"/>
+      <text class="pf-axis-label" x="${(W / 2).toFixed(1)}" y="${(H - 6).toFixed(1)}" text-anchor="middle">Parameter count (B) \u2192</text>
+      <text class="pf-axis-label" x="14" y="${(H / 2).toFixed(1)}" text-anchor="middle" transform="rotate(-90 14 ${(H / 2).toFixed(1)})">Generation speed (t/s) \u2191</text>
+      ${gridSvg}
+      ${frontierPath}
+      ${dotsSvg}
+    </svg>
+    <div class="pf-legend">
+      <div class="pf-legend-item"><span class="pf-legend-dot pf-legend-frontier"></span><span>On the Pareto frontier (efficient)</span></div>
+      <div class="pf-legend-item"><span class="pf-legend-dot pf-legend-dominated"></span><span>Dominated (another model is smaller and faster)</span></div>
+    </div>
+    <div class="takeaway"><strong>TAKEAWAY:</strong> ${takeaway}</div>
+  `;
+}
+
+/**
  * Perf Render Dashboard Template.
  */
 function perfRenderDashboardTemplate(records, summary, theme) {
@@ -1500,30 +1876,10 @@ function perfRenderDashboardTemplate(records, summary, theme) {
     .sort((a, b) => (a.ttft || 0) - (b.ttft || 0));
 
   const ttftSorted = [...models].filter((m) => typeof m.ttft === "number").sort((a, b) => a.ttft - b.ttft);
-  const ttftMax = Math.max(...ttftSorted.map((m) => m.ttft || 0), 1);
-  const ttftBars = ttftSorted.map((m, i) =>
-    perfSpeedBarRow(m.short, m.ttft, "ms", 100 - (((m.ttft || 0) / ttftMax) * 100), m.color, "val", i < 3 ? ["🥇 ", "🥈 ", "🥉 "][i] : "")
-  ).join("");
 
   const tpsSorted = [...models].filter((m) => typeof m.tps === "number").sort((a, b) => (b.tps || 0) - (a.tps || 0));
-  const tpsMax = Math.max(...tpsSorted.map((m) => m.tps || 0), 1);
-  const tpsBars = tpsSorted.map((m, i) =>
-    perfSpeedBarRow(m.short, m.tps, "", ((m.tps || 0) / tpsMax) * 100, m.color, "val-blue", i < 3 ? ["🥇 ", "🥈 ", "🥉 "][i] : "")
-  ).join("");
 
   const effSorted = [...sizedModels].filter((m) => typeof m.tpsPerB === "number").sort((a, b) => (b.tpsPerB || 0) - (a.tpsPerB || 0));
-  const effMax = Math.max(...effSorted.map((m) => m.tpsPerB || 0), 1);
-  const effBars = effSorted.map((m, i) =>
-    perfSpeedBarRow(`${m.short} (${formatNumber(m.params, 1)}B)`, m.tpsPerB, "", ((m.tpsPerB || 0) / effMax) * 100, m.color, "val-blue", i < 3 ? ["🥇 ", "🥈 ", "🥉 "][i] : "")
-  ).join("");
-
-  const speedRank = tpsSorted.map((m, i) => `
-    <div class="consistency-row">
-      <div class="consistency-name"><span class="color-dot" style="background:${m.color}"></span>${i === 0 ? "🥇 " : i === 1 ? "🥈 " : i === 2 ? "🥉 " : ""}${escapeHtml(m.short)}</div>
-      <div class="consistency-bar-bg"><div class="consistency-bar-fill" style="width:${formatNumber(((m.tps || 0) / tpsMax) * 100, 1)}%;background:${m.color}"></div></div>
-      <div class="consistency-value" style="color:${m.color}">${formatNumber(m.tps, 1)}</div>
-    </div>
-  `).join("");
 
   const bulletRows = perfRenderBulletRows(sizedModels);
   const dumbbellRows = perfRenderDumbbellRows(models);
@@ -1536,6 +1892,9 @@ function perfRenderDashboardTemplate(records, summary, theme) {
   }).join("");
   const scatterSvg = perfRenderScatterSvg(sizedModels);
   const docIngestionCard = perfRenderDocumentIngestionCard(records);
+  const parallelCoordinates = perfRenderParallelCoordinates(models);
+  const tokenMosaic = perfRenderTokenMosaic(models);
+  const paretoFrontier = perfRenderParetoFrontier(sizedModels);
 
   const topTps = tpsSorted[0] || null;
   const lowTps = tpsSorted[tpsSorted.length - 1] || null;
@@ -1610,32 +1969,6 @@ function perfRenderDashboardTemplate(records, summary, theme) {
           <div class="section-divider"></div>
           <div class="main-grid">
             ${bestInClassRow}
-            <div class="card-panel tone-orange" data-panel="ttft">
-              <h3 class="orange-header">THE RACE TO FIRST RESPONSE</h3>
-              <div class="sub-label">The first token is the first moment a model feels alive. Lower times here usually produce the strongest perception of responsiveness.</div>
-              <div>${ttftBars}</div>
-              <div class="takeaway"><strong>TAKEAWAY:</strong> The fastest successful responses arrive in roughly ${ttftSorted[0]?.ttft ? `${formatNumber(ttftSorted[0].ttft, 0)} ms` : "-"}.</div>
-            </div>
-
-            <div class="card-panel tone-blue" data-panel="tps">
-              <h3 class="blue-header">TOKENS PER SECOND</h3>
-              <div class="sub-label">Once generation begins, sustained output speed shapes how fast the answer continues to arrive.</div>
-              <div>${tpsBars}</div>
-              <div class="takeaway"><strong>WINNER:</strong> ${topTps ? `${escapeHtml(topTps.short)} leads at ${formatNumber(topTps.tps, 1)} TPS.` : "No TPS data."}</div>
-            </div>
-
-            <div class="card-panel full-width tone-dark" data-panel="size-speed-responsiveness">
-              <h3 class="dark-header">SIZE, SPEED, AND RESPONSIVENESS</h3>
-              <div class="sub-label">A three-dimensional view of practical model performance. This chart compares model size, output speed, and response latency to show which models punch above their weight.</div>
-              <div class="frontier-grid">
-                <div class="chart-container frontier-chart">${scatterSvg}</div>
-                <div>
-                  <div class="legend-title">MODEL FAMILY LEGEND</div>
-                  <div>${scatterLegend}</div>
-                  <div class="takeaway"><strong>NOTE:</strong> Larger bubbles indicate worse TTFT. The trendline estimates expected TPS from model size using the current filtered comparison set.</div>
-                </div>
-              </div>
-            </div>
 
             <div class="card-panel tone-orange" data-panel="quick-off-the-line">
               <h3 class="orange-header">QUICK OFF THE LINE OR BUILT FOR THE LONG RUN?</h3>
@@ -1651,33 +1984,37 @@ function perfRenderDashboardTemplate(records, summary, theme) {
               ${waterfall}
             </div>
 
-            <div class="card-panel tone-blue" data-panel="size-efficiency">
-              <h3 class="blue-header">BEST TPS PER 1B PARAMETERS</h3>
-              <div class="sub-label">This chart normalizes output speed by parameter count. Higher values indicate more generation speed per billion parameters, not a universal quality winner.</div>
-              <div>${effBars || `<div class="llm-empty">No parseable parameter sizes found.</div>`}</div>
-              <div class="takeaway"><strong>TAKEAWAY:</strong> ${bestEff ? `${escapeHtml(bestEff.short)} leads size-normalized generation efficiency at ${formatNumber(bestEff.tpsPerB, 2)} TPS / 1B.` : "No parseable parameter sizes found."}</div>
-            </div>
-
-            <div class="card-panel" data-panel="overall-speed">
-              <h3 class="orange-header">OVERALL SPEED COMPARISON</h3>
-              <div class="sub-label">Provides a compact all-model TPS ranking, so use it to confirm speed winners quickly and compare the spread between the fastest and slowest performers.</div>
-              <div class="two-col-grid" style="margin-bottom:9px;">
-                <div class="stat-highlight">
-                  <div class="big-num">${topTps ? formatNumber(topTps.tps, 1) : "-"}</div>
-                  <div class="stat-lbl">Peak TPS<br>${topTps ? escapeHtml(topTps.short) : "-"}</div>
-                </div>
-                <div class="stat-highlight">
-                  <div class="big-num">${lowTps ? formatNumber(lowTps.tps, 1) : "-"}</div>
-                  <div class="stat-lbl">Lowest TPS<br>${lowTps ? escapeHtml(lowTps.short) : "-"}</div>
-                </div>
-              </div>
-              <div>${speedRank}</div>
+            <div class="card-panel full-width tone-dark" data-panel="parallel-coordinates">
+              <h3 class="dark-header">PARALLEL COORDINATES</h3>
+              <div class="sub-label">Each line traces one model across six performance axes. Hover a line to isolate its profile and see exact values. Axes auto-orient so upward is always better (cost axes are inverted). Log scale separates models that span orders of magnitude.</div>
+              ${parallelCoordinates}
             </div>
 
             <div class="card-panel full-width tone-orange" data-panel="model-personality">
               <h3 class="orange-header">MODEL PERSONALITY PROFILE</h3>
               <div class="sub-label">A profile view of each model across speed, responsiveness, efficiency, and stability. Use this to compare whether a model is balanced or specialized.</div>
               ${radar}
+            </div>
+
+            <div class="card-panel full-width tone-dark" data-panel="pareto-frontier">
+              <h3 class="dark-header">EFFICIENCY FRONTIER</h3>
+              <div class="sub-label">Plots model size against generation speed and highlights the Pareto frontier: models that no other model beats on both axes. Models below the frontier are dominated, meaning a smaller and faster alternative exists.</div>
+              ${paretoFrontier}
+            </div>
+
+            <div class="card-panel full-width tone-dark" data-panel="size-speed-responsiveness">
+              <h3 class="dark-header">SIZE, SPEED, AND RESPONSIVENESS</h3>
+              <div class="sub-label">A three-dimensional view of practical model performance. This chart compares model size, output speed, and response latency to show which models punch above their weight.</div>
+              <div class="frontier-grid">
+                <div class="chart-container frontier-chart">${scatterSvg}</div>
+              </div>
+              <div class="takeaway"><strong>NOTE:</strong> Larger bubbles indicate worse TTFT. The trendline estimates expected TPS from model size using the current filtered comparison set.</div>
+            </div>
+
+            <div class="card-panel full-width tone-orange" data-panel="token-mosaic">
+              <h3 class="orange-header">TOKEN COMPOSITION MOSAIC</h3>
+              <div class="sub-label">Each row splits a model's output into reasoning tokens (internal chain-of-thought) and content tokens (user-facing answer). Taller rows indicate higher total output volume. Models that reason heavily may produce more total tokens but deliver fewer to the user.</div>
+              ${tokenMosaic}
             </div>
 
             ${docIngestionCard}
@@ -1757,6 +2094,7 @@ function renderDashboard(stats) {
     adjustPerfSpeedBarLabelWidth(elements.root);
     adjustPerfFrontierChartHeight(elements.root);
     rerenderPerfFrontierScatter(elements.root, filtered);
+    bindPerfParallelCoordinatesHover(elements.root);
   });
 }
 
@@ -2320,6 +2658,14 @@ function mountDashboardUi() {
         --compare-bar-height: 17px;
         --compare-row-space: 4px;
         --compare-value-gap: 10px;
+        --viz-label-size: .74rem;
+        --viz-value-size: .68rem;
+        --viz-tick-size: .66rem;
+        --viz-axis-size: .74rem;
+        --viz-meta-size: .66rem;
+        --viz-line-width: 2px;
+        --viz-point-size: 12px;
+        --viz-point-size-sm: 10px;
         --perf-font-display: "Unbounded", Impact, Haettenschweiler, "Arial Narrow Bold", sans-serif;
         --perf-font-head: "Open Sans", "Segoe UI", sans-serif;
         --perf-font-body: "Barlow Condensed", "Roboto Condensed", "Segoe UI", sans-serif;
@@ -2466,13 +2812,13 @@ function mountDashboardUi() {
       .perf-dashboard .main-grid > .card-panel[data-panel="latency-stability"] { flex-basis: 100%; width: 100%; }
       .perf-dashboard .main-grid > .card-panel[data-panel="model-personality"] { flex-basis: 100%; width: 100%; }
       .perf-dashboard .main-grid > .best-class-row { order: 0; }
-      .perf-dashboard .main-grid > .card-panel[data-panel="ttft"] { order: 10; }
-      .perf-dashboard .main-grid > .card-panel[data-panel="tps"] { order: 20; }
-      .perf-dashboard .main-grid > .card-panel[data-panel="size-speed-responsiveness"] { order: 30; min-height: 400px; }
-      .perf-dashboard .main-grid > .card-panel[data-panel="quick-off-the-line"] { order: 40; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="quick-off-the-line"] { order: 30; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="parallel-coordinates"] { order: 40; flex-basis: 100%; width: 100%; }
       .perf-dashboard .main-grid > .card-panel[data-panel="latency-anatomy"] { order: 50; }
-      .perf-dashboard .main-grid > .card-panel[data-panel="size-efficiency"] { order: 60; }
-      .perf-dashboard .main-grid > .card-panel[data-panel="model-personality"] { order: 70; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="model-personality"] { order: 60; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="pareto-frontier"] { order: 70; flex-basis: 100%; width: 100%; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="size-speed-responsiveness"] { order: 80; min-height: 620px; }
+      .perf-dashboard .main-grid > .card-panel[data-panel="token-mosaic"] { order: 90; flex-basis: 100%; width: 100%; }
       .perf-dashboard .main-grid > .card-panel[data-panel="document-ingestion-efficiency"] { order: 80; }
       .perf-dashboard .main-grid > .card-panel[data-panel="vision-tax"] { order: 90; }
       .perf-dashboard .main-grid > .card-panel[data-panel="latency-stability"] { order: 100; }
@@ -2548,15 +2894,15 @@ function mountDashboardUi() {
       }
       .perf-dashboard .card-panel.tone-orange {
         box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent-primary) 14%, transparent);
-        background: linear-gradient(180deg, color-mix(in srgb, var(--accent-primary) 6%, var(--bg-card)), var(--bg-card) 22%);
+        background: var(--bg-card);
       }
       .perf-dashboard .card-panel.tone-blue {
         box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent-secondary) 16%, transparent);
-        background: linear-gradient(180deg, color-mix(in srgb, var(--accent-secondary) 7%, var(--bg-card)), var(--bg-card) 22%);
+        background: var(--bg-card);
       }
       .perf-dashboard .card-panel.tone-dark {
         box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--text-primary) 8%, transparent);
-        background: linear-gradient(180deg, color-mix(in srgb, var(--header-bg) 22%, var(--bg-card)), var(--bg-card) 24%);
+        background: var(--bg-card);
       }
       .perf-dashboard .card-panel h3 {
         font-size: .82rem;
@@ -2621,8 +2967,8 @@ function mountDashboardUi() {
       .perf-dashboard .consistency-bar-fill { height:100%; border-radius:3px; opacity:.78; }
       .perf-dashboard .consistency-value { text-align:right; font-size:.66rem; font-weight:700; white-space:nowrap; }
       .perf-dashboard .chart-container { background: var(--bg-inset); border-radius: 5px; overflow: hidden; border:1px solid var(--border-color); }
-      .perf-dashboard .frontier-grid { display:grid; grid-template-columns: 2fr 1fr; gap: 12px; min-height: calc(400px - 96px); }
-      .perf-dashboard .frontier-chart { height: 100%; min-height: 260px; }
+      .perf-dashboard .frontier-grid { display:grid; grid-template-columns: 1fr; gap: 12px; min-height: calc(400px - 96px); }
+      .perf-dashboard .frontier-chart { height: 100%; min-height: 500px; }
       .perf-dashboard .perf-scatter-svg { width: 100%; height: 100%; display: block; }
       .perf-dashboard .scatter-grid { stroke: var(--canvas-grid); stroke-width: 1; }
       .perf-dashboard .scatter-axis { stroke: var(--canvas-text); stroke-width: 1.2; }
@@ -2654,7 +3000,7 @@ function mountDashboardUi() {
       .perf-dashboard .legend-item { display:flex; align-items:center; gap:6px; font-size:.74rem; color:var(--text-secondary); margin:2px 0; line-height:1.3; font-family: var(--perf-font-body); }
       .perf-dashboard .legend-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; opacity:.85; }
       .perf-dashboard .radar-wrap { display:grid; }
-      .perf-dashboard .radar-grid { display:grid; grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: start; row-gap: 22px; column-gap: 14px; }
+      .perf-dashboard .radar-grid { display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); align-items: start; row-gap: 22px; column-gap: 14px; }
       .perf-dashboard .radar-card {
         background: var(--bg-inset);
         border: 1px solid var(--border-color);
@@ -2680,21 +3026,23 @@ function mountDashboardUi() {
         text-overflow: ellipsis;
         white-space: nowrap;
         color: var(--text-primary);
-        font-size: .8rem;
+        font-size: .78rem;
         font-weight: 700;
+        line-height: 1.15;
+        font-family: var(--perf-font-body);
       }
       .perf-dashboard .radar-card-meta {
         color: var(--text-muted);
-        font-size: .66rem;
+        font-size: var(--viz-meta-size);
         text-transform: uppercase;
         letter-spacing: .06em;
         font-family: var(--perf-font-head);
       }
-      .perf-dashboard .radar-svg { width: 100%; height: auto; display: block; aspect-ratio: 13 / 9; min-height: 260px; }
+      .perf-dashboard .radar-svg { width: 100%; height: auto; display: block; aspect-ratio: 13 / 8; min-height: 195px; }
       .perf-dashboard .radar-ring { fill: rgba(255,255,255,0.02); stroke: var(--canvas-grid); stroke-width: 1; }
       .perf-dashboard .radar-axis { stroke: var(--canvas-grid); stroke-width: 1; }
-      .perf-dashboard .radar-label { fill: var(--text-secondary); font-size: 10px; font-family: var(--perf-font-head); }
-      .perf-dashboard .radar-shape { fill-opacity: .18; stroke: rgba(255,255,255,.8); stroke-width: 1.2; }
+      .perf-dashboard .radar-label { fill: var(--text-secondary); font-size: .62rem; font-family: var(--perf-font-head); }
+      .perf-dashboard .radar-shape { fill-opacity: .18; stroke: rgba(255,255,255,.8); stroke-width: 1.4; }
       .perf-dashboard .radar-note { margin-top: 8px; }
       .perf-dashboard .radar-stats {
         display:grid;
@@ -2705,7 +3053,7 @@ function mountDashboardUi() {
       .perf-dashboard .radar-stats span {
         display:block;
         color: var(--text-muted);
-        font-size: .6rem;
+        font-size: var(--viz-tick-size);
         text-transform: uppercase;
         letter-spacing: .06em;
         font-family: var(--perf-font-head);
@@ -2713,7 +3061,7 @@ function mountDashboardUi() {
       .perf-dashboard .radar-stats b {
         display:block;
         color: var(--text-primary);
-        font-size: .72rem;
+        font-size: var(--viz-label-size);
         font-family: var(--perf-font-mono);
       }
       .perf-dashboard .bullet-interpret,
@@ -2724,6 +3072,149 @@ function mountDashboardUi() {
         line-height: 1.35;
       }
       .perf-dashboard .radar-interpret { min-height: 0; }
+
+      /* ── Parallel Coordinates ── */
+      .perf-dashboard .pc-chart { width: 100%; height: auto; display: block; }
+      .perf-dashboard .pc-axis-line { stroke: var(--text-muted); stroke-opacity: 0.25; stroke-width: 1; }
+      .perf-dashboard .pc-tick { fill: var(--text-muted); opacity: 0.25; }
+      .perf-dashboard .pc-axis-label { font-size: .58rem; fill: var(--text-secondary); font-family: var(--perf-font-body); font-weight: 500; }
+      .perf-dashboard .pc-axis-unit { font-size: .5rem; fill: var(--text-muted); font-family: var(--perf-font-mono); }
+      .perf-dashboard .pc-dir-label { font-size: .5rem; font-family: var(--perf-font-mono); letter-spacing: 0.02em; }
+      .perf-dashboard .pc-dir-good { fill: var(--accent-secondary); opacity: 0.45; }
+      .perf-dashboard .pc-dir-cost { fill: var(--accent-primary); opacity: 0.45; }
+      .perf-dashboard .pc-dir-info { fill: var(--text-muted); opacity: 0.4; }
+      .perf-dashboard .pc-path-vis { stroke-width: 1.25; opacity: 0.65; stroke-linecap: round; transition: opacity 0.25s ease, stroke-width 0.25s ease, filter 0.25s ease; }
+      .perf-dashboard .pc-path-hit { cursor: pointer; pointer-events: stroke; }
+      .perf-dashboard .pc-dot { opacity: 0; transition: opacity 0.2s ease; pointer-events: none; }
+      .perf-dashboard .pc-chart:hover .pc-path-vis { opacity: 0.07; stroke-width: .95; }
+      .perf-dashboard .pc-chart:hover .pc-model:hover .pc-path-vis { opacity: 1; stroke-width: 1.8; filter: drop-shadow(0 0 3px currentColor); }
+      .perf-dashboard .pc-chart:hover .pc-model:hover .pc-dot { opacity: 1; }
+      .perf-dashboard .pc-model.is-dimmed .pc-path-vis { opacity: 0.07; stroke-width: .95; filter: none; }
+      .perf-dashboard .pc-model.is-dimmed .pc-dot { opacity: 0; }
+      .perf-dashboard .pc-model.is-active .pc-path-vis { opacity: 1; stroke-width: 1.8; filter: drop-shadow(0 0 3px currentColor); }
+      .perf-dashboard .pc-model.is-active .pc-dot { opacity: 1; }
+      .perf-dashboard .pc-legend { display: flex; flex-wrap: wrap; gap: 3px 14px; margin-top: 8px; padding: 6px 0; }
+      .perf-dashboard .pc-legend-item { display: flex; align-items: center; gap: 5px; font-size: .72rem; color: var(--text-secondary); font-family: var(--perf-font-body); }
+      .perf-dashboard .pc-legend-item.is-dimmed { opacity: 0.28; }
+      .perf-dashboard .pc-legend-item.is-active { opacity: 1; color: var(--text-primary); }
+      .perf-dashboard .pc-legend-swatch { display: inline-block; width: 16px; height: 3px; border-radius: 2px; flex-shrink: 0; }
+
+      /* ── Token Mosaic ── */
+      .perf-dashboard .tm-scale {
+        display:flex;
+        justify-content:space-between;
+        gap: 8px;
+        color: var(--text-muted);
+        font-size: var(--viz-value-size);
+        margin-bottom: 6px;
+        font-family: var(--perf-font-mono);
+      }
+      .perf-dashboard .tm-shell { display:grid; gap: 8px; }
+      .perf-dashboard .tm-stage {
+        display:grid;
+        grid-template-columns: var(--speed-bar-label-width) minmax(160px, 1fr) var(--speed-bar-value-width);
+        gap: var(--compare-value-gap);
+        align-items:center;
+      }
+      .perf-dashboard .tm-name {
+        min-width: 0;
+        font-size: .74rem;
+        color: var(--text-secondary);
+        display:flex;
+        align-items:flex-start;
+        white-space:normal;
+        overflow-wrap:anywhere;
+        line-height:1.15;
+        font-family: var(--perf-font-body);
+        font-weight: 600;
+      }
+      .perf-dashboard .tm-track-shell { display:grid; gap: 4px; }
+      .perf-dashboard .tm-track {
+        position: relative;
+        height: var(--compare-bar-height);
+        border-radius: 999px;
+        background: var(--bg-bar-track);
+        border: 1px solid var(--border-color);
+        overflow: hidden;
+      }
+      .perf-dashboard .tm-bar {
+        position:absolute;
+        top:1px;
+        bottom:1px;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        padding: 0 6px;
+        overflow:hidden;
+        white-space:nowrap;
+      }
+      .perf-dashboard .tm-bar-reason { left:0; background: var(--accent-primary); opacity: 0.72; transition: opacity 0.2s; }
+      .perf-dashboard .tm-bar-content { background: var(--accent-secondary); opacity: 0.6; transition: opacity 0.2s; }
+      .perf-dashboard .tm-stage:hover .tm-bar-reason { opacity: 0.92; }
+      .perf-dashboard .tm-stage:hover .tm-bar-content { opacity: 0.82; }
+      .perf-dashboard .tm-seg-label {
+        font-size: var(--viz-value-size);
+        color: #fff;
+        font-family: var(--perf-font-mono);
+        font-weight: 700;
+        pointer-events: none;
+      }
+      .perf-dashboard .tm-seg-label-content { font-weight: 600; }
+      .perf-dashboard .tm-total {
+        font-size: var(--viz-value-size);
+        color: var(--text-muted);
+        font-family: var(--perf-font-mono);
+        text-align:right;
+        white-space: nowrap;
+      }
+      .perf-dashboard .tm-meta {
+        display:flex;
+        justify-content:space-between;
+        gap: 8px;
+        color: var(--text-muted);
+        font-size: var(--viz-tick-size);
+        font-family: var(--perf-font-mono);
+      }
+      .perf-dashboard .tm-legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 8px; }
+      .perf-dashboard .tm-legend-item { display: flex; align-items: center; gap: 5px; font-size: .72rem; color: var(--text-secondary); font-family: var(--perf-font-body); }
+      .perf-dashboard .tm-swatch { display: inline-block; width: 14px; height: 14px; border-radius: 3px; flex-shrink: 0; }
+      .perf-dashboard .tm-swatch-reason { background: var(--accent-primary); opacity: 0.65; }
+      .perf-dashboard .tm-swatch-content { background: var(--accent-secondary); opacity: 0.55; }
+
+      /* ── Pareto Frontier ── */
+      .perf-dashboard .pf-chart { width: 100%; height: auto; display: block; }
+      .perf-dashboard .pf-axis { stroke: var(--canvas-text); stroke-width: .8; }
+      .perf-dashboard .pf-axis-label { font-size: .58rem; fill: var(--text-secondary); font-family: var(--perf-font-body); font-weight: 500; }
+      .perf-dashboard .pf-grid { stroke: var(--canvas-grid); stroke-width: .6; }
+      .perf-dashboard .pf-tick { font-size: .5rem; fill: var(--text-muted); font-family: var(--perf-font-mono); font-weight: 500; }
+      .perf-dashboard .pf-zone {
+        fill: color-mix(in srgb, var(--accent-positive) 10%, transparent);
+        stroke: color-mix(in srgb, var(--accent-positive) 28%, transparent);
+        stroke-width: 1;
+        stroke-dasharray: 4 4;
+      }
+      .perf-dashboard .pf-zone-label {
+        fill: color-mix(in srgb, var(--accent-positive) 70%, var(--text-secondary));
+        font-size: .5rem;
+        font-family: var(--perf-font-head);
+        font-weight: 600;
+        letter-spacing: .02em;
+      }
+      .perf-dashboard .pf-line { stroke: color-mix(in srgb, var(--accent-secondary) 76%, var(--text-primary)); stroke-width: 1.1; stroke-dasharray: 5 4; opacity: 0.75; }
+      .perf-dashboard .pf-bubble { fill: var(--text-secondary); opacity: 0.12; }
+      .perf-dashboard .pf-dot-frontier { fill: var(--accent-secondary); stroke: var(--dot-stroke); stroke-width: .8; cursor: pointer; transition: r 0.2s; }
+      .perf-dashboard .pf-dot-dominated { fill: var(--text-muted); stroke: var(--dot-stroke); stroke-width: .8; opacity: 0.72; cursor: pointer; }
+      .perf-dashboard .pf-halo { fill: var(--accent-secondary); opacity: 0.14; }
+      .perf-dashboard .pf-model:hover .pf-dot-frontier { r: 7; }
+      .perf-dashboard .pf-model:hover .pf-dot-dominated { opacity: 0.7; r: 5; }
+      .perf-dashboard .pf-model:hover .pf-halo { opacity: 0.2; }
+      .perf-dashboard .pf-label { font-size: .5rem; fill: var(--text-secondary); font-family: var(--perf-font-body); font-weight: 500; }
+      .perf-dashboard .pf-label-frontier { fill: var(--text-primary); font-weight: 600; }
+      .perf-dashboard .pf-legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 8px; }
+      .perf-dashboard .pf-legend-item { display: flex; align-items: center; gap: 5px; font-size: .72rem; color: var(--text-secondary); font-family: var(--perf-font-body); }
+      .perf-dashboard .pf-legend-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+      .perf-dashboard .pf-legend-frontier { background: var(--accent-secondary); }
+      .perf-dashboard .pf-legend-dominated { background: var(--text-muted); opacity: 0.45; }
       .perf-dashboard .bullet-list, .perf-dashboard .dumbbell-list, .perf-dashboard .box-list { display: grid; gap: var(--compare-row-space); }
       .perf-dashboard .bullet-row, .perf-dashboard .dumbbell-row, .perf-dashboard .box-row {
         background: var(--bg-inset);
@@ -2758,7 +3249,7 @@ function mountDashboardUi() {
       .perf-dashboard .bullet-band {
         position:absolute;
         inset: 0;
-        background: linear-gradient(90deg, rgba(255,255,255,0.02), rgba(255,255,255,0.08), rgba(255,255,255,0.02));
+        background: rgba(255,255,255,0.04);
       }
       .perf-dashboard .bullet-bar {
         position:absolute;
@@ -2798,21 +3289,21 @@ function mountDashboardUi() {
       .perf-dashboard .dumbbell-line {
         position:absolute;
         top: 7px;
-        height: 2px;
+        height: var(--viz-line-width);
         background: color-mix(in srgb, var(--accent-secondary) 40%, var(--accent-primary));
       }
       .perf-dashboard .dumbbell-point {
         position:absolute;
         top: 2px;
-        width: 12px;
-        height: 12px;
+        width: var(--viz-point-size);
+        height: var(--viz-point-size);
         border-radius: 50%;
         transform: translateX(-50%);
         border: 2px solid rgba(255,255,255,.75);
       }
       .perf-dashboard .dumbbell-point.end {
-        width: 10px;
-        height: 10px;
+        width: var(--viz-point-size-sm);
+        height: var(--viz-point-size-sm);
         top: 3px;
         border-color: rgba(0,0,0,.18);
       }
@@ -2849,7 +3340,7 @@ function mountDashboardUi() {
       .perf-dashboard .box-whisker {
         position:absolute;
         top: 7px;
-        height: 2px;
+        height: var(--viz-line-width);
         background: var(--text-muted);
       }
       .perf-dashboard .box-rect {
@@ -2906,7 +3397,7 @@ function mountDashboardUi() {
         font-family: var(--perf-font-mono);
       }
       .perf-dashboard .doc-track {
-        height: 10px;
+        height: var(--compare-bar-height);
         border-radius: 999px;
         background: var(--bg-bar-track);
         overflow: hidden;
@@ -2945,7 +3436,7 @@ function mountDashboardUi() {
       }
       .perf-dashboard .doc-delta-track {
         position: relative;
-        height: 12px;
+        height: var(--compare-bar-height);
         border-radius: 4px;
         background: var(--bg-bar-track);
         border: 1px solid var(--border-color);
@@ -2983,7 +3474,7 @@ function mountDashboardUi() {
         align-items: center;
       }
       .perf-dashboard .doc-dual-label {
-        font-size: .62rem;
+        font-size: var(--viz-tick-size);
         color: var(--text-muted);
         text-transform: uppercase;
         letter-spacing: .04em;
@@ -2991,7 +3482,7 @@ function mountDashboardUi() {
       }
       .perf-dashboard .doc-dual-value {
         text-align: right;
-        font-size: .62rem;
+        font-size: var(--viz-tick-size);
         color: var(--text-secondary);
         font-family: var(--perf-font-mono);
       }

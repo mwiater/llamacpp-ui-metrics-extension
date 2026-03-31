@@ -84,6 +84,10 @@ Light theme example:
 
 ![llama.cpp dashboard (light)](.screens/llamacpp-ui-metrics-dashboard-light.png)
 
+Dark theme example:
+
+![llama.cpp dashboard (dark)](.screens/llamacpp-ui-metrics-dashboard-dark.png)
+
 ### Dashboard header buttons
 
 The dashboard header includes the following controls:
